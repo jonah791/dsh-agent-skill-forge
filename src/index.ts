@@ -7,9 +7,9 @@
  * 设计定调（2026-08-16 主人；08-17 上下文蒸馏联动）：
  * - **被动插件**：后台只做 采集 + 信号 + 兜底——所有决策（蒸馏什么/何时蒸馏/怎么合并/技能写哪/剪不剪）归爱丽丝
  * - **上下文蒸馏联动（Ctx2Skill 被动化，主人 08-17 定调）**：技能 = 「上下文特征 → 应对策略」条件化规则——
- *   上下文（任务要求/文档/数据特征）与轨迹（工具/决策路径）天然联动：采集时记录每轮上下文规模，
- *   skill_context_signals 查「上下文密集型候选」，skill_extract 输出联动视图（上下文输入 ↔ 应对轨迹交错），
- *   蒸馏成条件化 SKILL.md；主动进化（对抗压力/版本选优）由 evolve 插件承担，不重复建主动引擎
+ *   上下文与轨迹天然联动（上下文特征由 agent 自己持有，无需候选信号检测——主人 08-17 修正）；
+ *   skill_extract 输出联动视图（上下文输入在前 ↔ 应对轨迹在后），蒸馏成条件化 SKILL.md；
+ *   主动进化（对抗压力/版本选优）由 evolve 插件承担，不重复建主动引擎
  * - **零子代理**：不派子智能体加速（钱包有限）——分析/提炼/合并在主会话内由爱丽丝完成（零额外 LLM 成本）
  * - **轨迹天然可得**：DSH 会话事件溯源（session.events 完整事件流）——插件只建索引不复制事件（零冗余，replay-safe）
  * - **技能形态**：SKILL.md（~/.agents/skills/<name>/SKILL.md，YAML frontmatter + 正文）——DSH 技能目录原生可加载
@@ -36,14 +36,14 @@ export interface Config {
   notifyAfterTurns: number
   /** 上下文候选阈值：某轮用户输入超过此字符数即标记为「上下文密集型」候选（联动蒸馏素材，Ctx2Skill 被动化）。 */
   ctxSignalChars: number
-  /** 压缩前炼化提醒阈值：累计估算 token 超过此值即通知「先炼化再压缩」（单次压缩收益最大化，主人 08-17 定调）。 */
+  /** 压缩前炼化提醒阈值：累计估算 token 超过此值即通知「先炼化再压缩」（单次压缩收益最大化，主人 08-17 定调；阈值 480k——主人实测压缩实际发生在 ~500k）。 */
   compactHintTokens: number
 }
 
 export const Config = z.object({
   persistIndex: z.boolean().default(true),
   ctxSignalChars: z.number().step(1).min(100).default(800),
-  compactHintTokens: z.number().step(1).min(10000).default(250000),
+  compactHintTokens: z.number().step(1).min(10000).default(480000),
   notifyEnabled: z.boolean().default(true),
   notifyAfterTurns: z.number().step(1).min(1).default(50),
 })
@@ -83,6 +83,12 @@ export function apply(ctx: Context, config: Config): void {
   const notifyState = new Map<string, { nextThreshold: number; notifiedCount: number }>()
   // 压缩轨迹标记：sessionId → 最近一次压缩的炼化候选标记
   const marksBySession = new Map<string, CompactionMark>()
+  // 已知工具面（技能只提供指导、不提供工具——工具引用校验用）：
+  // 内置核心工具基线 + 会话事件 tool/call 动态采集（插件运行期间见过的工具）
+  const knownTools = new Set<string>([
+    'run_code', 'read', 'write', 'edit', 'glob', 'grep', 'pwsh', 'web_search',
+    'remember', 'recall', 'life_sleep', 'life_status', 'taskboard_post', 'taskboard_list',
+  ])
   // 压缩前炼化提醒状态：sessionId → 已提醒的 token 阈值段
   const hintState = new Map<string, number>()
 
@@ -120,6 +126,8 @@ export function apply(ctx: Context, config: Config): void {
       maybeCompactHint(session, byTurn)
     } else if (ev.type === 'tool/call') {
       idx.toolCalls += 1
+      const toolName = (ev.data as { name?: string }).name
+      if (typeof toolName === 'string' && toolName.length > 0) knownTools.add(toolName)
     } else if (ev.type === 'tool/result') {
       if (ev.data.error !== undefined) idx.errors += 1
     } else if (ev.type === 'assistant/message') {
@@ -342,59 +350,6 @@ export function apply(ctx: Context, config: Config): void {
     },
   })
 
-  // ---------- 工具 1.5：skill_context_signals（上下文蒸馏候选信号）----------
-  // Ctx2Skill 被动化（主人 2026-08-17）：上下文密集型 turn = 联动蒸馏候选——
-  // 「上下文特征（任务要求/文档）→ 我的应对轨迹」的条件化技能素材。只读信号，决策归爱丽丝。
-  const ctxSignalsTool: ToolDefinition = defineTool({
-    name: 'skill_context_signals',
-    description: '上下文蒸馏候选信号（只读）：列出上下文密集型 turn（用户输入超过 ctxSignalChars 配置阈值）——任务要求/文档/数据特征集中的轮次，是「上下文特征 → 应对策略」联动蒸馏的素材。决策（蒸馏什么/何时蒸馏）归爱丽丝。',
-    parameters: {
-      minChars: { type: 'number', description: '覆盖阈值（缺省用配置 ctxSignalChars）' },
-      limit: { type: 'number', description: '返回条数上限（缺省 15）' },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          candidates: {
-            type: 'array',
-            items: {
-              type: 'object',
-              additionalProperties: false,
-              properties: {
-                turn: { type: 'number', required: true },
-                contextChars: { type: 'number', required: true },
-                toolCalls: { type: 'number', required: true },
-                errors: { type: 'number', required: true },
-              },
-            },
-            required: true,
-          },
-          threshold: { type: 'number', required: true },
-          note: { type: 'string', required: true },
-        },
-      },
-      render: (args, value) => [{ type: 'text', text: '上下文候选 ' + value.candidates.length + ' 个（阈值 ' + value.threshold + ' 字符）' }],
-    },
-    async execute(args, exec) {
-      const { byTurn } = turnsOf(exec)
-      if (byTurn.size === 0) return { candidates: [], threshold: config.ctxSignalChars, note: '无轨迹数据' }
-      const threshold = (args.minChars as number | undefined) ?? config.ctxSignalChars
-      const limit = (args.limit as number | undefined) ?? 15
-      const candidates = [...byTurn.entries()]
-        .map(([turn, t]) => ({ turn, contextChars: t.contextChars, toolCalls: t.toolCalls, errors: t.errors, wasted: t.wasted ?? false }))
-        .filter((x) => x.contextChars >= threshold && !x.wasted)
-        .sort((a, b) => b.contextChars - a.contextChars)
-        .slice(0, limit)
-      return {
-        candidates,
-        threshold,
-        note: '上下文候选 = 联动蒸馏素材：用 skill_extract 提取该 turn 的上下文与应对轨迹，蒸馏成「上下文特征 → 应对策略」条件化技能',
-      }
-    },
-  })
-
   // ---------- 工具 2：skill_extract ----------
   const extractTool: ToolDefinition = defineTool({
     name: 'skill_extract',
@@ -491,7 +446,7 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- 工具 3：skill_commit ----------
   const commitTool: ToolDefinition = defineTool({
     name: 'skill_commit',
-    description: '写入技能（可写）：把蒸馏出的技能保存为 SKILL.md（YAML frontmatter + 正文）——默认写用户级 ~/.agents/skills/<name>/SKILL.md（跨项目可加载），scope=project 写 <cwd>/.agents/skills/。',
+    description: '写入技能（可写）：把蒸馏出的技能保存为 SKILL.md（YAML frontmatter + 正文）——默认写用户级 ~/.agents/skills/<name>/SKILL.md（跨项目可加载），scope=project 写 <cwd>/.agents/skills/。纪律：技能只提供指导（决策/流程/规避），不提供工具——工具引用限于系统工具面（提交时自动校验，幻觉工具会警告）。',
     parameters: {
       name: { type: 'string', required: true, description: '技能名（小写 kebab-case，如 alpha-refine）' },
       description: { type: 'string', required: true, description: '一句话描述（frontmatter description；技能目录显示用）' },
@@ -545,16 +500,22 @@ export function apply(ctx: Context, config: Config): void {
         }
         if (marked > 0 && exec.agent?.session !== undefined) persistIndex(exec.agent.session)
       }
-      return { path, name, note: 'SKILL.md 已写入；新会话技能目录自动发现（dsh-skill-filesystem）。已炼化轨迹 ' + turns.length + ' 轮标记为废渣，不再重复提示' }
+      // 工具引用校验（技能只提供指导、不提供工具）：正文引用的工具必须属于系统工具面
+      const toolRefs = extractToolRefs(body)
+      const unknownTools = toolRefs.filter((t) => !knownTools.has(t))
+      let note = 'SKILL.md 已写入；新会话技能目录自动发现（dsh-skill-filesystem）。已炼化轨迹 ' + turns.length + ' 轮标记为废渣，不再重复提示'
+      if (unknownTools.length > 0) {
+        note += '。\n⚠ 工具引用校验：以下工具不在已知工具面，可能是幻觉工具（技能只提供指导，不提供工具）：' + unknownTools.join(', ')
+      }
+      return { path, name, note }
     },
   })
 
   ctx.tools.register(signalsTool)
   ctx.tools.register(marksTool)
-  ctx.tools.register(ctxSignalsTool)
   ctx.tools.register(extractTool)
   ctx.tools.register(commitTool)
-  ctx.logger('dsh-agent-skill-forge').info('ready（skill_signals / skill_marks / skill_context_signals / skill_extract / skill_commit 已注册——被动形态，决策归爱丽丝）')
+  ctx.logger('dsh-agent-skill-forge').info('ready（skill_signals / skill_marks / skill_extract / skill_commit 已注册——被动形态，决策归爱丽丝）')
 }
 
 /** 消息内容摘要（text 块拼接截断） */
@@ -566,6 +527,24 @@ function summarizeBlocks(message: Message): string {
     else parts.push('[' + block.type + ']')
   }
   return parts.join('\n')
+}
+
+/**
+ * 提取文本中的工具引用：反引号内标识符 + 「工具：xxx」模式。
+ * 技能只提供指导、不提供工具（SkillForge 约束版定义）——引用的工具必须是系统工具面已有能力。
+ */
+function extractToolRefs(text: string): string[] {
+  const refs = new Set<string>()
+  // 反引号内的小写标识符（代码/工具引用惯用）：`wq_simulate`
+  const backtick = text.match(/`([a-z][a-z0-9_]{2,40})`/g)
+  if (backtick) for (const m of backtick) refs.add(m.slice(1, -1))
+  // 「工具：xxx」或「工具:xxx」模式
+  const colon = text.match(/工具[:：]\s*([a-z][a-z0-9_]{2,40})/g)
+  if (colon) for (const m of colon) {
+    const name = m.split(/[:：]/)[1]?.trim()
+    if (name !== undefined) refs.add(name)
+  }
+  return [...refs]
 }
 
 function truncate(text: string, n: number): string {
