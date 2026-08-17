@@ -36,6 +36,10 @@ pnpm build
 - 技能形态：SKILL.md（YAML frontmatter + 条件化正文），DSH 技能目录原生可加载
 - 分工：被动提取（本插件）+ 主动进化（dsh-agent-evolve）+ 决策归爱丽丝
 
+## 相关
+
+- [我的数字生命爱丽丝 — 插件生态中心（架构总览）](https://github.com/jonah791/alice-digital-life)
+
 ## License
 
 MIT
