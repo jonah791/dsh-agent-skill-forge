@@ -1,32 +1,41 @@
-# dsh-agent-skill-forge
+# dsh-agent-skill-forge — 被动技能熔炉
 
-被动技能熔炉（Trace2Skill 思想落地）——把会话轨迹蒸馏为可迁移技能。
+DSH（DeepSeek Harness）插件：把轨迹与上下文蒸馏为可加载技能（SKILL.md）——Trace2Skill 与 Ctx2Skill 思想的被动落地。所有决策（蒸馏什么/何时蒸馏/怎么写）归 agent 本人。
 
-## 设计定调（2026-08-16 主人）
+## 功能特性
 
-- **被动插件**：后台只做 采集 + 信号 + 兜底；所有决策（蒸馏什么/何时蒸馏/怎么合并/技能写哪/剪不剪）归爱丽丝
-- **零子代理**：不派子智能体（钱包有限）——分析/提炼/合并在主会话内由爱丽丝完成（零额外 LLM 成本）
-- **轨迹天然可得**：DSH 会话事件溯源——插件只建索引不复制事件（零冗余，replay-safe）
-- **技能形态**：SKILL.md（~/.agents/skills/<name>/SKILL.md）——DSH 技能目录原生可加载（dsh-skill-filesystem 自动发现）
-- **成败判断归爱丽丝**：插件不判成败，只报轨迹结构与信号
+- **轨迹蒸馏**：会话事件流建索引（零冗余）→ 信号 → 提取 → 写入技能目录
+- **上下文蒸馏联动（Ctx2Skill 被动化）**：`skill_context_signals` 找上下文密集型候选；`skill_extract` 输出联动视图（上下文特征 → 应对轨迹）——蒸馏条件化技能
+- **压缩前炼化触发**：上下文压力高时提醒「先炼化再压缩」（单次压缩收益最大化）
+- **废渣标记**：炼化完成的轨迹标记 wasted，信号/候选不再重复提示
+- **压缩轨迹标记**：compaction 时自动记录高价值候选 turn
 
-## 工具
+## 安装
+
+```bash
+cd <你的 self-plugins 目录>
+git clone https://github.com/jonah791/dsh-agent-skill-forge.git
+cd dsh-agent-skill-forge
+pnpm install
+pnpm build
+```
+
+## 使用
 
 | 工具 | 说明 |
 |------|------|
-| skill_signals | 信号（只读）：轨迹轮次索引（事件数/工具调用/报错/token）——选候选后提取分析 |
-| skill_extract | 提取轨迹（只读）：按 turn 范围提取事件序列文本，零 LLM 调用 |
-| skill_commit | 写入技能（可写）：SKILL.md（user=~/.agents/skills 跨项目 / project=项目 .agents/skills） |
+| `skill_signals` | 轨迹轮次索引（含废渣标注） |
+| `skill_marks` | 压缩时标记的炼化候选 |
+| `skill_context_signals` | 上下文密集型候选（联动蒸馏素材） |
+| `skill_extract` | 提取轨迹/联动视图（linkContext） |
+| `skill_commit` | 写入 SKILL.md（turns 参数声明炼化范围 → 废渣标记） |
 
-## 蒸馏流程（爱丽丝侧，Trace2Skill 三阶段）
+## 技术要点
 
-1. **轨迹生成**：DSH 事件溯源自动记录（插件后台索引）
-2. **补丁提案**（我分析）：成功轨迹 → 泛化行为规则（SuccessAnalyst 角色）；失败轨迹 → 根因 → 规避规则（ErrorAnalyst 角色）——同会话内完成，零子代理
-3. **合并提交**：去重/冲突消解（判断归我）→ skill_commit 写 SKILL.md → 技能目录自动发现
+- 零子代理、零额外 LLM 成本：采集纯计数，提取纯数据
+- 技能形态：SKILL.md（YAML frontmatter + 条件化正文），DSH 技能目录原生可加载
+- 分工：被动提取（本插件）+ 主动进化（dsh-agent-evolve）+ 决策归爱丽丝
 
-## 验证记录（2026-08-16）
+## License
 
-- 采集：turn 117 索引（132 事件/1527 token）✓
-- 提取：turn 范围事件序列 ✓
-- 蒸馏：今日踩坑轨迹 → dsh-plugin-pitfalls 技能（6 条条件化规避规则）✓
-- 加载：写入后技能目录实时发现（catalog 自动更新）✓
+MIT
