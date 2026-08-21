@@ -23,7 +23,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { Message } from '@deepseek-ai/dsh-llm'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs'
 
 export const name = 'agent-skill-forge'
 export const inject = ['tools', 'agents'] as const
@@ -32,7 +32,7 @@ export interface Config {
   persistIndex: boolean
   /** 炼化通知开关：轨迹采集达到阈值时通知爱丽丝（信号送达，炼化决策归爱丽丝） */
   notifyEnabled: boolean
-  /** 炼化通知阈值：每采集多少轮轨迹通知一次（缺省 50——攒够一批再炼化，不频繁打扰） */
+  /** 炼化通知阈值：每采集多少轮轨迹检查一次（缺省 100——价值驱动：有高价值轮才通知，不频繁打扰） */
   notifyAfterTurns: number
   /** 上下文候选阈值：某轮用户输入超过此字符数即标记为「上下文密集型」候选（联动蒸馏素材，Ctx2Skill 被动化）。 */
   ctxSignalChars: number
@@ -45,7 +45,7 @@ export const Config = z.object({
   ctxSignalChars: z.number().step(1).min(100).default(800),
   compactHintTokens: z.number().step(1).min(10000).default(480000),
   notifyEnabled: z.boolean().default(true),
-  notifyAfterTurns: z.number().step(1).min(1).default(50),
+  notifyAfterTurns: z.number().step(1).min(1).default(100),
 })
 
 /** 轨迹轮次索引（轻量：只记统计与边界，完整事件在会话日志） */
@@ -106,7 +106,9 @@ export function apply(ctx: Context, config: Config): void {
     if (turn === undefined) return
     let byTurn = indexBySession.get(session.id)
     if (byTurn === undefined) {
-      byTurn = new Map()
+      // 重启恢复：采集起点也先读磁盘（否则新 map 只含新 turn，turnsOf 的懒加载
+      // 因 get 非 undefined 而不触发——重启后历史索引丢失，2026-08-21 修复）
+      byTurn = loadIndexFromDisk(session as { id: string; header?: { cwd?: string } }) ?? new Map()
       indexBySession.set(session.id, byTurn)
     }
     let idx = byTurn.get(turn)
@@ -164,6 +166,9 @@ export function apply(ctx: Context, config: Config): void {
         sessionId: session.id,
         updatedAt: new Date().toISOString(),
         turns: [...byTurn.entries()].sort((a, b) => a[0] - b[0]).map(([, t]) => t),
+        // 通知/提示状态一并落盘（重启不丢提醒节流——否则重启后可能重复提醒，主人 2026-08-21 强调）
+        notify: notifyState.get(session.id) ?? null,
+        hint: hintState.get(session.id) ?? null,
       }
       writeFileSync(join(dir, 'skill-forge-index.json'), JSON.stringify(payload, null, 2), 'utf8')
     } catch { /* 持久化失败静默 */ }
@@ -178,6 +183,47 @@ export function apply(ctx: Context, config: Config): void {
       const payload = { sessionId: session.id, ...mark }
       writeFileSync(join(dir, 'skill-forge-marks.json'), JSON.stringify(payload, null, 2), 'utf8')
     } catch { /* 持久化失败静默 */ }
+  }
+
+  // 重启恢复：进程内索引/标记是内存态，web 重启即失——工具首次使用时从磁盘懒加载
+  // （persistIndex 已落盘 <cwd>/.dsh/skill-forge-index.json 与 skill-forge-marks.json）
+  function loadIndexFromDisk(session: { id: string; header?: { cwd?: string } }): Map<number, TurnIndex> | undefined {
+    try {
+      const cwd = session.header?.cwd
+      if (cwd === undefined) return undefined
+      const file = join(cwd, '.dsh', 'skill-forge-index.json')
+      if (!existsSync(file)) return undefined
+      const data = JSON.parse(readFileSync(file, 'utf8')) as {
+        sessionId?: string
+        turns?: TurnIndex[]
+        notify?: { nextThreshold: number; notifiedCount: number }
+        hint?: number
+      }
+      if (data.sessionId !== session.id) return undefined
+      // 恢复通知/提示节流状态（重启不丢提醒时机——否则 nextThreshold 回退、可能重复提醒）
+      if (data.notify !== undefined && data.notify !== null) {
+        notifyState.set(session.id, data.notify)
+      } else if ((data.turns?.length ?? 0) >= config.notifyAfterTurns) {
+        // 旧文件兼容：无 notify 状态但已有大量轨迹——推进阈值防重启后立即重复提醒
+        notifyState.set(session.id, { nextThreshold: (data.turns?.length ?? 0) + config.notifyAfterTurns, notifiedCount: 0 })
+      }
+      if (data.hint !== undefined && data.hint !== null) hintState.set(session.id, data.hint)
+      const map = new Map<number, TurnIndex>()
+      for (const t of data.turns ?? []) map.set(t.turn, t)
+      return map
+    } catch { return undefined }
+  }
+
+  function loadMarksFromDisk(session: { id: string; header?: { cwd?: string } }): CompactionMark | undefined {
+    try {
+      const cwd = session.header?.cwd
+      if (cwd === undefined) return undefined
+      const file = join(cwd, '.dsh', 'skill-forge-marks.json')
+      if (!existsSync(file)) return undefined
+      const data = JSON.parse(readFileSync(file, 'utf8')) as { sessionId?: string } & CompactionMark
+      if (data.sessionId !== session.id) return undefined
+      return { at: data.at, compactionId: data.compactionId, candidates: data.candidates }
+    } catch { return undefined }
   }
 
   // 压缩前炼化提醒（主人 2026-08-17：单次压缩收益最大化——压缩前上下文最全，先炼化再压缩）
@@ -205,15 +251,29 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   // 炼化通知：轨迹达到阈值 → 信号送达（wakeup=true 到达即送达；炼化决策归爱丽丝）
+  // 价值驱动（主人 2026-08-21：通知太频繁/时机不对）：本批必须含高价值轮
+  // （报错/复杂工具链/大上下文）才通知——纯闲聊轮不打扰；无价值也推进阈值防反复检查
   function maybeNotify(session: { id: string }, byTurn: Map<number, TurnIndex>): void {
     if (!config.notifyEnabled) return
     const state = notifyState.get(session.id) ?? { nextThreshold: config.notifyAfterTurns, notifiedCount: 0 }
     if (byTurn.size < state.nextThreshold) return
+    let hasValue = false
+    for (const [, t] of byTurn) {
+      if (t.errors > 0 || t.toolCalls >= 5 || t.contextChars >= config.ctxSignalChars) {
+        hasValue = true
+        break
+      }
+    }
+    if (!hasValue) {
+      state.nextThreshold = byTurn.size + config.notifyAfterTurns
+      notifyState.set(session.id, state)
+      return
+    }
     const agent = ctx.agents?.get(session.id as never) // SessionId branded type 断言
     if (agent !== undefined) {
       let errorTurns = 0
       for (const [, t] of byTurn) if (t.errors > 0) errorTurns += 1
-      const text = '[skill-forge] 已采集 ' + byTurn.size + ' 轮轨迹（含 ' + errorTurns + ' 轮报错）——可炼化（蒸馏技能）。是否炼化、炼化哪些由爱丽丝决定：skill_signals 查看候选，skill_extract 提取，skill_commit 写入。'
+      const text = '[skill-forge] 已采集 ' + byTurn.size + ' 轮轨迹（含 ' + errorTurns + ' 轮报错）——有高价值轮可炼化（蒸馏技能）。是否炼化、炼化哪些由爱丽丝决定：skill_signals 查看候选，skill_extract 提取，skill_commit 写入。'
       try {
         agent.send(
           createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'plugin', plugin: 'dsh-agent-skill-forge' } }),
@@ -232,7 +292,14 @@ export function apply(ctx: Context, config: Config): void {
     byTurn: Map<number, TurnIndex>
   } {
     const session = exec.agent?.session
-    const byTurn = session === undefined ? new Map<number, TurnIndex>() : (indexBySession.get(session.id) ?? new Map<number, TurnIndex>())
+    let byTurn: Map<number, TurnIndex>
+    if (session === undefined) {
+      byTurn = new Map<number, TurnIndex>()
+    } else {
+      // 重启恢复：进程内索引丢失时从磁盘懒加载（web 重启不丢轨迹）
+      byTurn = indexBySession.get(session.id) ?? loadIndexFromDisk(session) ?? new Map<number, TurnIndex>()
+      indexBySession.set(session.id, byTurn)
+    }
     return { session, byTurn }
   }
 
@@ -344,7 +411,12 @@ export function apply(ctx: Context, config: Config): void {
     },
     async execute(_args, exec) {
       const session = exec.agent?.session
-      const mark = session === undefined ? undefined : marksBySession.get(session.id)
+      let mark = session === undefined ? undefined : marksBySession.get(session.id)
+      if (mark === undefined && session !== undefined) {
+        // 重启恢复：压缩标记进程内丢失时从磁盘懒加载
+        mark = loadMarksFromDisk(session)
+        if (mark !== undefined) marksBySession.set(session.id, mark)
+      }
       if (mark === undefined) return { at: '', candidates: [], note: '无压缩标记（压缩后才有；压缩触发时会自动标记）' }
       return { at: mark.at, candidates: mark.candidates, note: '候选 = 压缩前高价值轨迹；skill_extract 提取联动视图后蒸馏成条件化技能' }
     },
@@ -386,18 +458,21 @@ export function apply(ctx: Context, config: Config): void {
       const ctxLines: string[] = []
       const lines: string[] = []
       let eventCount = 0
-      const nodes = [...session.surface.nodes]
-      for (const seq of nodes) {
-        const event = session.events[seq] as unknown as {
-          type?: string
-          data?: {
-            turn?: number
-            message?: Message
-            name?: string
-            arguments?: string
-            error?: unknown
-          }
-        } | undefined
+      // 全量事件流提取（append-only 日志保留原始事件）：压缩只替换 surface 表层，
+      // 原始事件仍在 session.events 里——压缩标记的候选 turn 压缩后仍可提取
+      // （原实现只遍历 surface.nodes，压缩后旧 turn 被替换出表层 → 提取失效，2026-08-21 修复）
+      const events = session.events as unknown as readonly {
+        type?: string
+        data?: {
+          turn?: number
+          message?: Message
+          name?: string
+          arguments?: string
+          error?: unknown
+        }
+      }[]
+      for (let i = 0; i < events.length; i++) {
+        const event = events[i]
         if (event === undefined) continue
         const turn = event.data?.turn
         if (turn === undefined || turn < start || turn > end) continue
