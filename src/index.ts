@@ -32,7 +32,7 @@ export interface Config {
   persistIndex: boolean
   /** 炼化通知开关：轨迹采集达到阈值时通知爱丽丝（信号送达，炼化决策归爱丽丝） */
   notifyEnabled: boolean
-  /** 炼化通知阈值：每采集多少轮轨迹检查一次（缺省 100——价值驱动：有高价值轮才通知，不频繁打扰） */
+  /** 炼化通知阈值：每采集多少轮轨迹检查一次（缺省 200——价值驱动：有高价值轮才通知，不频繁打扰；2026-08-23 主人定调改 200） */
   notifyAfterTurns: number
   /** 上下文候选阈值：某轮用户输入超过此字符数即标记为「上下文密集型」候选（联动蒸馏素材，Ctx2Skill 被动化）。 */
   ctxSignalChars: number
@@ -45,7 +45,7 @@ export const Config = z.object({
   ctxSignalChars: z.number().step(1).min(100).default(800),
   compactHintTokens: z.number().step(1).min(10000).default(480000),
   notifyEnabled: z.boolean().default(true),
-  notifyAfterTurns: z.number().step(1).min(1).default(100),
+  notifyAfterTurns: z.number().step(1).min(1).default(200),
 })
 
 /** 轨迹轮次索引（轻量：只记统计与边界，完整事件在会话日志） */
@@ -72,13 +72,18 @@ interface TurnIndex {
 interface CompactionMark {
   at: string
   compactionId?: string
-  candidates: { turn: number; toolCalls: number; errors: number; contextChars: number; estTokens: number }[]
+  candidates: { turn: number; toolCalls: number; errors: number; contextChars: number; estTokens: number; wasted?: boolean }[]
 }
 
 export function apply(ctx: Context, config: Config): void {
   console.log('[dsh-agent-skill-forge] apply', new Date().toISOString(), '(HMR probe)')
 
   const indexBySession = new Map<string, Map<number, TurnIndex>>()
+  // 当前上下文压力：sessionId → 最近一次请求的完整输入 token（usage.inputTokens）。
+  // 主人 2026-08-24 指出「把两个会话的上下文加在一起算」：旧实现把每次请求的完整
+  // inputTokens 累加进 estTokens（一轮内多次请求把同一份上下文重复计入 → 虚高）。
+  // 本字段是「当前上下文占用」的诚实快照——上下文压力判断用这个，不跨轮累加。
+  const contextPressureBySession = new Map<string, number>()
   // 炼化通知状态：sessionId → 下次通知阈值
   const notifyState = new Map<string, { nextThreshold: number; notifiedCount: number }>()
   // 压缩轨迹标记：sessionId → 最近一次压缩的炼化候选标记
@@ -91,6 +96,10 @@ export function apply(ctx: Context, config: Config): void {
   ])
   // 压缩前炼化提醒状态：sessionId → 已提醒的 token 阈值段
   const hintState = new Map<string, number>()
+  // 压缩段起点（2026-08-23 修复）：compaction/start 时记录该会话压缩前的最大 turn——
+  // maybeCompactHint 只统计本段（压缩后）的轨迹累计；压缩后上下文重置，段累计从 0 重新积累，
+  // 否则历史累计永久超阈值、提醒节流失效（压缩后永远不再提醒）
+  const segmentBySession = new Map<string, number>()
 
   // 会话事件采集（零 LLM 成本：纯计数 + 估算）
   ctx.on('session/event', (session, event) => {
@@ -135,7 +144,15 @@ export function apply(ctx: Context, config: Config): void {
     } else if (ev.type === 'assistant/message') {
       const usage = ev.data.usage
       if (usage !== undefined) {
-        idx.estTokens += (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0)
+        const input = usage.inputTokens ?? 0
+        const output = usage.outputTokens ?? 0
+        // 主人 2026-08-24：不要「把上下文加在一起算」。旧实现 `idx.estTokens += input+output`
+        // 把每次请求的完整上下文（usage.inputTokens 是整段上下文的 token 数，非增量）重复累加——
+        // 一轮内多次请求会把同一份上下文重复计入，多轮下来严重虚高（实测 ~1163k）。
+        // 修正：estTokens 记录该轮「最近一次请求的完整上下文大小」（上下文压力快照），赋值而非累加。
+        idx.estTokens = input + output
+        // 当前上下文占用 = 最新请求的完整输入 token（上下文压力判断用，不跨轮累加）
+        contextPressureBySession.set(session.id, input)
       }
     } else if (ev.type === 'compaction/start') {
       // 压缩触发（此刻上下文最全）：计算炼化候选 → 打标记落盘（供压缩后炼化，单次压缩收益最大化）
@@ -151,8 +168,28 @@ export function apply(ctx: Context, config: Config): void {
         persistMarks(session, mark)
         console.log('[dsh-agent-skill-forge] 压缩标记', candidates.length + ' 候选 turn', session.id, new Date().toISOString())
       }
+      // 压缩段重置（2026-08-23 修复）：压缩后上下文重置，本段起点 = 当前最大 turn，
+      // hintState 清零让本段从 0 重新累计——不再被压缩前历史累计永久顶满（否则提醒永不再触发）
+      let segmentStart = 0
+      if (byTurn2 !== undefined) {
+        for (const turn of byTurn2.keys()) if (turn > segmentStart) segmentStart = turn
+      }
+      segmentBySession.set(session.id, segmentStart)
+      hintState.set(session.id, 0)
+      // 压缩后上下文重置：当前上下文压力清零（否则旧压力继续顶满提醒——主人 2026-08-24 修正）
+      contextPressureBySession.delete(session.id)
     }
   })
+
+  // 索引文件路径：按 sessionId 独立（主人 2026-08-24 跨会话问题）——同一 cwd 下多个会话
+  // 共享一个 skill-forge-index.json 会互相覆盖（A 写 → B 覆盖 → A 重启后索引永久丢失）。
+  // 文件名带 sessionId 隔离；load 校验 sessionId 兜底。旧共享文件（无 sessionId 后缀）不再读写。
+  function indexFile(cwd: string, sessionId: string): string {
+    return join(cwd, '.dsh', 'skill-forge-index-' + sessionId + '.json')
+  }
+  function marksFile(cwd: string, sessionId: string): string {
+    return join(cwd, '.dsh', 'skill-forge-marks-' + sessionId + '.json')
+  }
 
   function persistIndex(session: { id: string; header?: { cwd?: string } }): void {
     try {
@@ -169,8 +206,10 @@ export function apply(ctx: Context, config: Config): void {
         // 通知/提示状态一并落盘（重启不丢提醒节流——否则重启后可能重复提醒，主人 2026-08-21 强调）
         notify: notifyState.get(session.id) ?? null,
         hint: hintState.get(session.id) ?? null,
+        // 压缩段起点落盘（重启不丢段边界——否则重启后段起点丢失、提醒统计错乱）
+        segment: segmentBySession.get(session.id) ?? null,
       }
-      writeFileSync(join(dir, 'skill-forge-index.json'), JSON.stringify(payload, null, 2), 'utf8')
+      writeFileSync(indexFile(cwd, session.id), JSON.stringify(payload, null, 2), 'utf8')
     } catch { /* 持久化失败静默 */ }
   }
 
@@ -181,23 +220,24 @@ export function apply(ctx: Context, config: Config): void {
       const dir = join(cwd, '.dsh')
       mkdirSync(dir, { recursive: true })
       const payload = { sessionId: session.id, ...mark }
-      writeFileSync(join(dir, 'skill-forge-marks.json'), JSON.stringify(payload, null, 2), 'utf8')
+      writeFileSync(marksFile(cwd, session.id), JSON.stringify(payload, null, 2), 'utf8')
     } catch { /* 持久化失败静默 */ }
   }
 
   // 重启恢复：进程内索引/标记是内存态，web 重启即失——工具首次使用时从磁盘懒加载
-  // （persistIndex 已落盘 <cwd>/.dsh/skill-forge-index.json 与 skill-forge-marks.json）
+  // （persistIndex 已落盘 <cwd>/.dsh/skill-forge-index-<sessionId>.json 与 skill-forge-marks-<sessionId>.json）
   function loadIndexFromDisk(session: { id: string; header?: { cwd?: string } }): Map<number, TurnIndex> | undefined {
     try {
       const cwd = session.header?.cwd
       if (cwd === undefined) return undefined
-      const file = join(cwd, '.dsh', 'skill-forge-index.json')
+      const file = indexFile(cwd, session.id)
       if (!existsSync(file)) return undefined
       const data = JSON.parse(readFileSync(file, 'utf8')) as {
         sessionId?: string
         turns?: TurnIndex[]
         notify?: { nextThreshold: number; notifiedCount: number }
         hint?: number
+        segment?: number | null
       }
       if (data.sessionId !== session.id) return undefined
       // 恢复通知/提示节流状态（重启不丢提醒时机——否则 nextThreshold 回退、可能重复提醒）
@@ -208,6 +248,8 @@ export function apply(ctx: Context, config: Config): void {
         notifyState.set(session.id, { nextThreshold: (data.turns?.length ?? 0) + config.notifyAfterTurns, notifiedCount: 0 })
       }
       if (data.hint !== undefined && data.hint !== null) hintState.set(session.id, data.hint)
+      // 恢复压缩段起点（旧文件无 segment 时保持 0 = 全量统计，兼容历史语义）
+      if (data.segment !== undefined && data.segment !== null) segmentBySession.set(session.id, data.segment)
       const map = new Map<number, TurnIndex>()
       for (const t of data.turns ?? []) map.set(t.turn, t)
       return map
@@ -218,7 +260,7 @@ export function apply(ctx: Context, config: Config): void {
     try {
       const cwd = session.header?.cwd
       if (cwd === undefined) return undefined
-      const file = join(cwd, '.dsh', 'skill-forge-marks.json')
+      const file = marksFile(cwd, session.id)
       if (!existsSync(file)) return undefined
       const data = JSON.parse(readFileSync(file, 'utf8')) as { sessionId?: string } & CompactionMark
       if (data.sessionId !== session.id) return undefined
@@ -227,32 +269,53 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   // 压缩前炼化提醒（主人 2026-08-17：单次压缩收益最大化——压缩前上下文最全，先炼化再压缩）
-  // 感知：轨迹累计估算 token 接近压缩阈值 → 提醒「先炼化再压缩」；节流（每个阈值段一次）
+  // 感知：本压缩段轨迹累计估算 token 接近压缩阈值 → 提醒「先炼化再压缩」；节流（每个阈值段一次）
+  // 2026-08-23 修复：
+  // 1) 只统计本压缩段（segmentStart 之后）的累计——压缩后上下文重置，段累计从 0 重新积累，
+  //    不再被压缩前历史累计（>1.5M）永久顶满导致节流吞掉后续提醒
+  // 2) hintState 仅在 send 成功后推进——agent 未找到 / send 抛错都留日志且不推进状态，
+  //    避免「状态显示已提醒但消息从未投递」的自我欺骗（旧版状态在 if 外无条件推进）
+  // 3) reenter 根因（2026-08-23 实测日志）：turn/end 事件由 session.append('turn/end', ...) 同步发布，
+  //    其回调内直接 agent.send → inbox.splice → session.append('agent/inbox/spliced', ...) 触发
+  //    「session append cannot reenter while another append is being published」——所以每次 send 都抛错。
+  //    memory 插件在 compaction/end 投递成功是因为该事件发布路径无此冲突。
+  //    修复：setImmediate 延迟到当前 append 事务完成后投递（send 成功才推进状态）。
   function maybeCompactHint(session: { id: string }, byTurn: Map<number, TurnIndex>): void {
-    let total = 0
-    for (const [, t] of byTurn) total += t.estTokens
+    // 主人 2026-08-24：上下文压力 = 当前上下文占用（最新请求完整输入 token），
+    // 不是「把所有轮次的上下文加在一起」。旧实现 `total += t.estTokens` 跨轮累加虚高。
+    const total = contextPressureBySession.get(session.id) ?? 0
     if (total < config.compactHintTokens) return
     const lastHinted = hintState.get(session.id) ?? 0
     if (lastHinted >= config.compactHintTokens && total - lastHinted < config.compactHintTokens * 0.3) return // 节流：同段不重复
     const agent = ctx.agents?.get(session.id as never)
-    if (agent !== undefined) {
-      // 计算当前候选数（供提示）
-      const candidates = [...byTurn.entries()].filter(([, t]) => (t.toolCalls >= 3 || t.errors > 0 || t.contextChars >= config.ctxSignalChars) && !t.wasted).length
-      const text = '[skill-forge] 上下文压力高（估算 ~' + Math.round(total / 1000) + 'k tokens）——压缩前建议先炼化：压缩前上下文最全，单次压缩收益最大化。skill_marks 查候选（当前 ' + candidates + ' 个），skill_extract 提取联动视图，skill_commit 写入 SKILL.md；炼化完再压缩。'
-      try {
-        agent.send(
-          createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'plugin', plugin: 'dsh-agent-skill-forge' } }),
-          'next-turn',
-          true,
-        )
-      } catch { /* 通知失败静默 */ }
+    if (agent === undefined) {
+      // 诊断：agent 未找到（不推进状态，下次 turn/end 重试）
+      console.log('[dsh-agent-skill-forge] 压缩前提醒跳过：agent 未找到', session.id, 'segmentTotal', total, new Date().toISOString())
+      return
     }
-    hintState.set(session.id, total)
+    // 计算当前候选数（供提示）
+    const candidates = [...byTurn.entries()].filter(([, t]) => (t.toolCalls >= 3 || t.errors > 0 || t.contextChars >= config.ctxSignalChars) && !t.wasted).length
+    const text = '[skill-forge] 上下文压力高（估算 ~' + Math.round(total / 1000) + 'k tokens）——压缩前建议先炼化：压缩前上下文最全，单次压缩收益最大化。skill_marks 查候选（当前 ' + candidates + ' 个），skill_extract 提取联动视图，skill_commit 写入 SKILL.md；炼化完再压缩。'
+    const message = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'plugin', plugin: 'dsh-agent-skill-forge' } })
+    // reenter 修复：延迟到当前 session.append 事务完成后投递
+    setImmediate(() => {
+      try {
+        // next-step（主人 2026-08-25）：插话插到下一帧之前，而非等到下一回合结束才注入
+        agent.send(message, 'next-step', true)
+      } catch (err) {
+        // 发送失败：不推进状态（下次 turn/end 重试），留日志定位
+        console.log('[dsh-agent-skill-forge] 压缩前提醒发送失败', session.id, String(err), new Date().toISOString())
+        return
+      }
+      hintState.set(session.id, total)
+    })
   }
 
   // 炼化通知：轨迹达到阈值 → 信号送达（wakeup=true 到达即送达；炼化决策归爱丽丝）
   // 价值驱动（主人 2026-08-21：通知太频繁/时机不对）：本批必须含高价值轮
   // （报错/复杂工具链/大上下文）才通知——纯闲聊轮不打扰；无价值也推进阈值防反复检查
+  // 2026-08-23 修复：notifiedCount 仅在 send 成功后推进——agent 未找到 / send 抛错
+  // 留日志且不推进状态（旧版状态在 if 外无条件推进，造成「已通知但从未投递」的假象）
   function maybeNotify(session: { id: string }, byTurn: Map<number, TurnIndex>): void {
     if (!config.notifyEnabled) return
     const state = notifyState.get(session.id) ?? { nextThreshold: config.notifyAfterTurns, notifiedCount: 0 }
@@ -270,21 +333,30 @@ export function apply(ctx: Context, config: Config): void {
       return
     }
     const agent = ctx.agents?.get(session.id as never) // SessionId branded type 断言
-    if (agent !== undefined) {
-      let errorTurns = 0
-      for (const [, t] of byTurn) if (t.errors > 0) errorTurns += 1
-      const text = '[skill-forge] 已采集 ' + byTurn.size + ' 轮轨迹（含 ' + errorTurns + ' 轮报错）——有高价值轮可炼化（蒸馏技能）。是否炼化、炼化哪些由爱丽丝决定：skill_signals 查看候选，skill_extract 提取，skill_commit 写入。'
-      try {
-        agent.send(
-          createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'plugin', plugin: 'dsh-agent-skill-forge' } }),
-          'next-turn',
-          true, // wakeup=true：到达即送达（不打断当前思维；忙则排队）
-        )
-      } catch { /* 通知失败静默（轨迹索引仍在，可随时查） */ }
+    if (agent === undefined) {
+      // 诊断：agent 未找到（不推进状态，下次 turn/end 重试）
+      console.log('[dsh-agent-skill-forge] 炼化通知跳过：agent 未找到', session.id, 'size', byTurn.size, new Date().toISOString())
+      return
     }
-    state.nextThreshold = byTurn.size + config.notifyAfterTurns
-    state.notifiedCount += 1
-    notifyState.set(session.id, state)
+    let errorTurns = 0
+    for (const [, t] of byTurn) if (t.errors > 0) errorTurns += 1
+    const text = '[skill-forge] 已采集 ' + byTurn.size + ' 轮轨迹（含 ' + errorTurns + ' 轮报错）——有高价值轮可炼化（蒸馏技能）。是否炼化、炼化哪些由爱丽丝决定：skill_signals 查看候选，skill_extract 提取，skill_commit 写入。'
+    const message = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'plugin', plugin: 'dsh-agent-skill-forge' } })
+    // reenter 修复（同 maybeCompactHint）：turn/end 回调内同步 agent.send 会触发 session.append reenter，
+    // 延迟到当前 append 事务完成后投递；send 成功才推进状态
+    setImmediate(() => {
+      try {
+        // next-step（主人 2026-08-25）：插话插到下一帧之前，而非等到下一回合结束才注入
+        agent.send(message, 'next-step', true) // wakeup=true：到达即送达（不打断当前思维；忙则排队）
+      } catch (err) {
+        // 发送失败：不推进状态（下次 turn/end 重试），留日志定位
+        console.log('[dsh-agent-skill-forge] 炼化通知发送失败', session.id, String(err), new Date().toISOString())
+        return
+      }
+      state.nextThreshold = byTurn.size + config.notifyAfterTurns
+      state.notifiedCount += 1
+      notifyState.set(session.id, state)
+    })
   }
 
   function turnsOf(exec: ToolRunContext): {
@@ -346,7 +418,10 @@ export function apply(ctx: Context, config: Config): void {
           note: { type: 'string', required: true },
         },
       },
-      render: (args, value) => [{ type: 'text', text: '轨迹信号 ' + value.turns.length + ' 轮（共 ' + value.stats.totalTurns + '）——蒸馏决策归爱丽丝' }],
+      render: (args, value) => {
+        const list = value.turns.map((t: any) => `• turn ${t.turn} · ev ${t.eventCount} · tool ${t.toolCalls} · err ${t.errors} · ${Math.round((t.estTokens ?? 0) / 1000)}k${t.wasted ? ' [废]' : ''}`).join('\n')
+        return [{ type: 'text', text: `轨迹信号 ${value.turns.length} 轮（共 ${value.stats.totalTurns}）——蒸馏决策归爱丽丝\n${list}` }]
+      },
     },
     async execute(args, exec) {
       const { byTurn } = turnsOf(exec)
@@ -400,6 +475,7 @@ export function apply(ctx: Context, config: Config): void {
                 errors: { type: 'number', required: true },
                 contextChars: { type: 'number', required: true },
                 estTokens: { type: 'number', required: true },
+                wasted: { type: 'boolean', description: '已炼化废渣（不再提示）' },
               },
             },
             required: true,
@@ -407,7 +483,11 @@ export function apply(ctx: Context, config: Config): void {
           note: { type: 'string', required: true },
         },
       },
-      render: (args, value) => [{ type: 'text', text: '压缩标记 @' + value.at + '：' + value.candidates.length + ' 个炼化候选' }],
+      render: (args, value) => {
+        if (value.candidates.length === 0) return [{ type: 'text', text: value.note ?? '无候选' }]
+        const list = value.candidates.map((c: any) => `• turn ${c.turn} · tool ${c.toolCalls} · err ${c.errors} · ${Math.round((c.estTokens ?? 0) / 1000)}k${c.wasted ? ' [已炼化]' : ''}`).join('\n')
+        return [{ type: 'text', text: `压缩标记 @${value.at}：${value.candidates.length} 个炼化候选\n${list}` }]
+      },
     },
     async execute(_args, exec) {
       const session = exec.agent?.session
@@ -444,7 +524,10 @@ export function apply(ctx: Context, config: Config): void {
           note: { type: 'string', required: true },
         },
       },
-      render: (args, value) => [{ type: 'text', text: '轨迹 ' + value.turnCount + ' 轮 / ' + value.eventCount + ' 事件 / ' + value.segments.length + ' 段' }],
+      render: (args, value) => {
+        if (value.segments.length === 0) return [{ type: 'text', text: value.note ?? '无内容' }]
+        return [{ type: 'text', text: value.segments.join('\n\n--- 分段 ---\n\n') }]
+      },
     },
     async execute(args, exec) {
       const { session, byTurn } = turnsOf(exec)

@@ -1,3 +1,13 @@
+<!--
+  DSH 插件生态公约声明（plugin-ecosystem-convention · 组合优先/声明清晰/兼容优先）
+  purpose: 被动技能熔炉（Trace2Skill 思想落地）：后台采集会话轨迹索引（零 LLM 成本）+ 信号送达；蒸馏/合并/剪枝决策归爱丽丝；技能输出为 SKILL.md（DSH 技能目录原生可加载）
+  inject: 'tools','agents'
+  tools: skill_signals,skill_marks,skill_extract,skill_commit
+  runtime: host-only
+  envDeps: 无（纯逻辑/标准 Node）
+  boundary: 无特殊授权边界
+  compat: cordis ^4.0.1 / dsh-tools ^0.1.0-rc.6
+-->
 # dsh-agent-skill-forge — 被动技能熔炉
 
 DSH（DeepSeek Harness）插件：把轨迹与上下文蒸馏为可加载技能（SKILL.md）——Trace2Skill 与 Ctx2Skill 思想的被动落地。所有决策（蒸馏什么/何时蒸馏/怎么写）归 agent 本人。
