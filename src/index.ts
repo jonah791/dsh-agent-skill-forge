@@ -32,8 +32,10 @@ export interface Config {
   persistIndex: boolean
   /** 炼化通知开关：轨迹采集达到阈值时通知爱丽丝（信号送达，炼化决策归爱丽丝） */
   notifyEnabled: boolean
-  /** 炼化通知阈值：每采集多少轮轨迹检查一次（缺省 200——价值驱动：有高价值轮才通知，不频繁打扰；2026-08-23 主人定调改 200） */
+  /** 炼化通知轮次阈值：采集轮数 ≥ 此值即检查（复合触发之一——轮次或工具调用任一先达）。缺省 100（2026-08-27 方案 B 主人定调：turn ≥ 100 或累计工具调用 ≥ 200） */
   notifyAfterTurns: number
+  /** 炼化通知工具调用阈值：累计工具调用 ≥ 此值即检查（复合触发之二）。缺省 200——长跑会话「工具调用密集但轮次慢」，纯轮次阈值不敏感（2026-08-27 方案 B） */
+  notifyAfterTools: number
   /** 上下文候选阈值：某轮用户输入超过此字符数即标记为「上下文密集型」候选（联动蒸馏素材，Ctx2Skill 被动化）。 */
   ctxSignalChars: number
   /** 压缩前炼化提醒阈值：累计估算 token 超过此值即通知「先炼化再压缩」（单次压缩收益最大化，主人 08-17 定调；阈值 480k——主人实测压缩实际发生在 ~500k）。 */
@@ -45,7 +47,8 @@ export const Config = z.object({
   ctxSignalChars: z.number().step(1).min(100).default(800),
   compactHintTokens: z.number().step(1).min(10000).default(480000),
   notifyEnabled: z.boolean().default(true),
-  notifyAfterTurns: z.number().step(1).min(1).default(200),
+  notifyAfterTurns: z.number().step(1).min(1).default(100),
+  notifyAfterTools: z.number().step(1).min(1).default(200),
 })
 
 /** 轨迹轮次索引（轻量：只记统计与边界，完整事件在会话日志） */
@@ -84,8 +87,8 @@ export function apply(ctx: Context, config: Config): void {
   // inputTokens 累加进 estTokens（一轮内多次请求把同一份上下文重复计入 → 虚高）。
   // 本字段是「当前上下文占用」的诚实快照——上下文压力判断用这个，不跨轮累加。
   const contextPressureBySession = new Map<string, number>()
-  // 炼化通知状态：sessionId → 下次通知阈值
-  const notifyState = new Map<string, { nextThreshold: number; notifiedCount: number }>()
+  // 炼化通知状态：sessionId → 下次通知阈值（轮次/工具调用双轨独立推进——方案 B 复合触发，2026-08-27 主人定调）
+  const notifyState = new Map<string, { nextTurnThreshold: number; nextToolThreshold: number; notifiedCount: number }>()
   // 压缩轨迹标记：sessionId → 最近一次压缩的炼化候选标记
   const marksBySession = new Map<string, CompactionMark>()
   // 已知工具面（技能只提供指导、不提供工具——工具引用校验用）：
@@ -235,17 +238,29 @@ export function apply(ctx: Context, config: Config): void {
       const data = JSON.parse(readFileSync(file, 'utf8')) as {
         sessionId?: string
         turns?: TurnIndex[]
-        notify?: { nextThreshold: number; notifiedCount: number }
+        notify?: { nextTurnThreshold: number; nextToolThreshold: number; notifiedCount: number } | { nextThreshold: number; notifiedCount: number }
         hint?: number
         segment?: number | null
       }
       if (data.sessionId !== session.id) return undefined
       // 恢复通知/提示节流状态（重启不丢提醒时机——否则 nextThreshold 回退、可能重复提醒）
       if (data.notify !== undefined && data.notify !== null) {
-        notifyState.set(session.id, data.notify)
+        const n = data.notify
+        // 旧文件兼容：单阈值 { nextThreshold } 迁移为双阈值（方案 B，2026-08-27）
+        notifyState.set(session.id, 'nextToolThreshold' in n
+          ? { nextTurnThreshold: n.nextTurnThreshold, nextToolThreshold: n.nextToolThreshold, notifiedCount: n.notifiedCount }
+          : {
+              nextTurnThreshold: n.nextThreshold,
+              nextToolThreshold: (data.turns?.reduce((s, t) => s + (t.toolCalls ?? 0), 0) ?? 0) + config.notifyAfterTools,
+              notifiedCount: n.notifiedCount,
+            })
       } else if ((data.turns?.length ?? 0) >= config.notifyAfterTurns) {
         // 旧文件兼容：无 notify 状态但已有大量轨迹——推进阈值防重启后立即重复提醒
-        notifyState.set(session.id, { nextThreshold: (data.turns?.length ?? 0) + config.notifyAfterTurns, notifiedCount: 0 })
+        notifyState.set(session.id, {
+          nextTurnThreshold: (data.turns?.length ?? 0) + config.notifyAfterTurns,
+          nextToolThreshold: (data.turns?.reduce((s, t) => s + (t.toolCalls ?? 0), 0) ?? 0) + config.notifyAfterTools,
+          notifiedCount: 0,
+        })
       }
       if (data.hint !== undefined && data.hint !== null) hintState.set(session.id, data.hint)
       // 恢复压缩段起点（旧文件无 segment 时保持 0 = 全量统计，兼容历史语义）
@@ -316,10 +331,18 @@ export function apply(ctx: Context, config: Config): void {
   // （报错/复杂工具链/大上下文）才通知——纯闲聊轮不打扰；无价值也推进阈值防反复检查
   // 2026-08-23 修复：notifiedCount 仅在 send 成功后推进——agent 未找到 / send 抛错
   // 留日志且不推进状态（旧版状态在 if 外无条件推进，造成「已通知但从未投递」的假象）
+  // 2026-08-27 方案 B（主人定调）：触发条件从纯轮次改为复合——「轮次 ≥ notifyAfterTurns 或
+  // 累计工具调用 ≥ notifyAfterTools」任一先达即检查。长跑会话「工具调用密集但轮次慢」
+  // （turn 132 有 14 工具/4831 事件），纯轮次阈值对这类会话不敏感（主会话 118 轮从未达 200）。
+  // 双轨独立推进：通知成功后轮次阈值 += notifyAfterTurns、工具阈值 += notifyAfterTools。
   function maybeNotify(session: { id: string }, byTurn: Map<number, TurnIndex>): void {
     if (!config.notifyEnabled) return
-    const state = notifyState.get(session.id) ?? { nextThreshold: config.notifyAfterTurns, notifiedCount: 0 }
-    if (byTurn.size < state.nextThreshold) return
+    const state = notifyState.get(session.id) ?? { nextTurnThreshold: config.notifyAfterTurns, nextToolThreshold: config.notifyAfterTools, notifiedCount: 0 }
+    // 累计工具调用 = 全会话所有轮的 toolCalls 之和（byTurn 跨压缩累积，不重置）
+    let totalTools = 0
+    for (const [, t] of byTurn) totalTools += t.toolCalls
+    // 复合触发：轮次或工具调用任一达阈值即检查（防止轮次慢但工具密集的会话被漏掉）
+    if (byTurn.size < state.nextTurnThreshold && totalTools < state.nextToolThreshold) return
     let hasValue = false
     for (const [, t] of byTurn) {
       if (t.errors > 0 || t.toolCalls >= 5 || t.contextChars >= config.ctxSignalChars) {
@@ -328,19 +351,21 @@ export function apply(ctx: Context, config: Config): void {
       }
     }
     if (!hasValue) {
-      state.nextThreshold = byTurn.size + config.notifyAfterTurns
+      // 无价值轮：双轨都推进（防止低价值会话反复检查空转）
+      state.nextTurnThreshold = byTurn.size + config.notifyAfterTurns
+      state.nextToolThreshold = totalTools + config.notifyAfterTools
       notifyState.set(session.id, state)
       return
     }
     const agent = ctx.agents?.get(session.id as never) // SessionId branded type 断言
     if (agent === undefined) {
       // 诊断：agent 未找到（不推进状态，下次 turn/end 重试）
-      console.log('[dsh-agent-skill-forge] 炼化通知跳过：agent 未找到', session.id, 'size', byTurn.size, new Date().toISOString())
+      console.log('[dsh-agent-skill-forge] 炼化通知跳过：agent 未找到', session.id, 'size', byTurn.size, 'tools', totalTools, new Date().toISOString())
       return
     }
     let errorTurns = 0
     for (const [, t] of byTurn) if (t.errors > 0) errorTurns += 1
-    const text = '[skill-forge] 已采集 ' + byTurn.size + ' 轮轨迹（含 ' + errorTurns + ' 轮报错）——有高价值轮可炼化（蒸馏技能）。是否炼化、炼化哪些由爱丽丝决定：skill_signals 查看候选，skill_extract 提取，skill_commit 写入。'
+    const text = '[skill-forge] 已采集 ' + byTurn.size + ' 轮轨迹 / 累计 ' + totalTools + ' 次工具调用（含 ' + errorTurns + ' 轮报错）——有高价值轮可炼化（蒸馏技能）。是否炼化、炼化哪些由爱丽丝决定：skill_signals 查看候选，skill_extract 提取，skill_commit 写入。'
     const message = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'plugin', plugin: 'dsh-agent-skill-forge' } })
     // reenter 修复（同 maybeCompactHint）：turn/end 回调内同步 agent.send 会触发 session.append reenter，
     // 延迟到当前 append 事务完成后投递；send 成功才推进状态
@@ -353,7 +378,8 @@ export function apply(ctx: Context, config: Config): void {
         console.log('[dsh-agent-skill-forge] 炼化通知发送失败', session.id, String(err), new Date().toISOString())
         return
       }
-      state.nextThreshold = byTurn.size + config.notifyAfterTurns
+      state.nextTurnThreshold = byTurn.size + config.notifyAfterTurns
+      state.nextToolThreshold = totalTools + config.notifyAfterTools
       state.notifiedCount += 1
       notifyState.set(session.id, state)
     })
