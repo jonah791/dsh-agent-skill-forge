@@ -10,6 +10,12 @@
 -->
 # dsh-agent-skill-forge — 被动技能熔炉
 
+
+<p align="center">
+  <a href="https://github.com/jonah791/dsh-agent-skill-forge"><img src="https://img.shields.io/badge/version-0.1.0-blue" alt="version"></a>
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
+  <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
+</p>
 DSH（DeepSeek Harness）插件：把轨迹与上下文蒸馏为可加载技能（SKILL.md）——Trace2Skill 与 Ctx2Skill 思想的被动落地。所有决策（蒸馏什么/何时蒸馏/怎么写）归 agent 本人。
 
 ## 功能特性
