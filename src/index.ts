@@ -580,20 +580,24 @@ export function apply(ctx: Context, config: Config): void {
       const lines: string[] = []
       let eventCount = 0
       // 全量事件流提取（append-only 日志保留原始事件）：压缩只替换 surface 表层，
-      // 原始事件仍在 session.events 里——压缩标记的候选 turn 压缩后仍可提取
+      // 原始事件仍在日志里——压缩标记的候选 turn 压缩后仍可提取
       // （原实现只遍历 surface.nodes，压缩后旧 turn 被替换出表层 → 提取失效，2026-08-21 修复）
-      const events = session.events as unknown as readonly {
-        type?: string
-        data?: {
-          turn?: number
-          message?: Message
-          name?: string
-          arguments?: string
-          error?: unknown
-        }
-      }[]
-      for (let i = 0; i < events.length; i++) {
-        const event = events[i]
+      // alpha.4 适配（2026-09-06）：Session.events 已移除，改经 seq + eventAt 按需读日志。
+      const sessionView = session as unknown as {
+        seq: number
+        eventAt(seq: number): {
+          type?: string
+          data?: {
+            turn?: number
+            message?: Message
+            name?: string
+            arguments?: string
+            error?: unknown
+          }
+        } | undefined
+      }
+      for (let i = 0; i < sessionView.seq; i += 1) {
+        const event = sessionView.eventAt(i)
         if (event === undefined) continue
         const turn = event.data?.turn
         if (turn === undefined || turn < start || turn > end) continue
