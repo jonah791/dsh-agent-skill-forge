@@ -38,14 +38,23 @@ export interface Config {
   notifyAfterTools: number
   /** 上下文候选阈值：某轮用户输入超过此字符数即标记为「上下文密集型」候选（联动蒸馏素材，Ctx2Skill 被动化）。 */
   ctxSignalChars: number
-  /** 压缩前炼化提醒阈值：累计估算 token 超过此值即通知「先炼化再压缩」（单次压缩收益最大化，主人 08-17 定调；2026-09-01 主人定调调至 300k）。 */
+  /** 压缩前炼化提醒阈值：累计估算 token 超过此值即通知「先炼化再压缩」（单次压缩收益最大化，主人 08-17 定调；2026-09-01 定调调至 300k）。 */
   compactHintTokens: number
+  /**
+   * 是否发送「压缩前炼化提醒」（压缩提醒）。
+   *
+   * 主人 2026-09-14 定调**关闭**：压缩已能**轮内自办**（`dsh-compact-provider` 直触：授权命中即
+   * 在轮内起压缩事务），不再需要一条提醒来催我「先炼化再压缩」——提醒与压缩撞在同一拍，只添噪音。
+   * 注意区分：**压缩提醒（本项）≠ 上下文提醒**（`dsh-agent-context` 的越阈值提示），后者保留。
+   */
+  compactHintEnabled: boolean
 }
 
 export const Config = z.object({
   persistIndex: z.boolean().default(true),
   ctxSignalChars: z.number().step(1).min(100).default(800),
   compactHintTokens: z.number().step(1).min(10000).default(300000),
+  compactHintEnabled: z.boolean().default(true),
   notifyEnabled: z.boolean().default(true),
   notifyAfterSteps: z.number().step(1).min(1).default(200),
   notifyAfterTools: z.number().step(1).min(1).default(200),
@@ -142,7 +151,8 @@ export function apply(ctx: Context, config: Config): void {
       idx.endAt = new Date().toISOString()
       if (config.persistIndex) persistIndex(session)
       maybeNotify(session, byTurn)
-      maybeCompactHint(session, byTurn)
+      // 压缩提醒（2026-09-14 主人定调默认关闭）：压缩已能轮内自办，不再需要催「先炼化再压缩」
+      if (config.compactHintEnabled) maybeCompactHint(session, byTurn)
     } else if (ev.type === 'tool/call') {
       idx.toolCalls += 1
       const toolName = (ev.data as { name?: string }).name
