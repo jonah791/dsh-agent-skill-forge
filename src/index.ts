@@ -14,6 +14,13 @@
  * - **轨迹天然可得**：DSH 会话事件溯源（session.events 完整事件流）——插件只建索引不复制事件（零冗余，replay-safe）
  * - **技能形态**：SKILL.md（~/.agents/skills/<name>/SKILL.md，YAML frontmatter + 正文）——DSH 技能目录原生可加载
  * - **成败判断归爱丽丝**：插件不判成败，只报轨迹结构与信号
+ *
+ * 结构（2026-09-14 可维护性补课，AGENTS.md §5.22）——本文件只做 cordis 接线：
+ * - `src/policy.ts`   纯决策：通知阈值/冷却节流/状态迁移/输入校验（零 IO、零时钟）
+ * - `src/aggregate.ts` 纯聚合：轮次索引/候选排序/视图构建/分段（零 IO、零时钟）
+ * - `src/text.ts`     纯文本：消息摘要/工具引用解析/提示文案
+ * - `src/trace-store.ts` 落盘薄壳：读吞错返回 undefined，写吞错返回 bool（绝不反噬主流程）
+ * 回归测试：`node --test tests/*.test.mjs`（先 `npm run build` 产出 lib/）
  */
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
@@ -23,7 +30,32 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { Message } from '@deepseek-ai/dsh-llm'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import {
+  advanceNotifyState,
+  decideCompactHint,
+  decideNotify,
+  defaultNotifyState,
+  migrateNotifyState,
+  validateSkillCommit,
+} from './policy.js'
+import {
+  buildExtractView,
+  buildSignalsView,
+  countCandidateTurns,
+  createTurnIndex,
+  maxTurn,
+  selectCompactionCandidates,
+} from './aggregate.js'
+import type { CompactionMark, ExtractEvent, TurnIndex } from './aggregate.js'
+import {
+  buildCommitNote,
+  buildCompactHintText,
+  buildNotifyText,
+  extractToolRefs,
+  summarizeBlocks,
+} from './text.js'
+import { readJsonFile, skillIndexPath, skillMarksPath, writeJsonFile } from './trace-store.js'
 
 export const name = 'agent-skill-forge'
 export const inject = ['tools', 'agents', 'memoryApi'] as const
@@ -60,35 +92,6 @@ export const Config = z.object({
   notifyAfterTools: z.number().step(1).min(1).default(200),
 })
 
-/** 轨迹轮次索引（轻量：只记统计与边界，完整事件在会话日志） */
-interface TurnIndex {
-  turn: number
-  startAt: string
-  endAt: string | null
-  eventCount: number
-  toolCalls: number
-  /** 该轮关闭的步数（step/end 计数，harness 官方步计数点）。旧磁盘索引无此字段 = undefined → 按 0 处理。 */
-  steps?: number
-  errors: number
-  estTokens: number
-  /** 上下文规模：该轮用户输入（user/message text）累计字符数——上下文密集型候选阈值。 */
-  contextChars: number
-  /** 废渣标记：该轮轨迹已被炼化（技能蒸馏完成）——信号/候选/通知全部排除（主人 2026-08-17 定调）。 */
-  wasted?: boolean
-}
-
-/**
- * 压缩轨迹标记（主人 2026-08-17 定调：单次压缩收益最大化）：
- * 压缩触发（compaction/start）时——此刻上下文最全——按索引计算「炼化候选」（高价值 turn），
- * 打标记落盘；压缩完成（compaction/end）后通知爱丽丝（决策归爱丽丝：炼化什么/何时炼化）。
- * 与记忆插件的 checkpoint 通知互补（它管记忆，这里管技能）。
- */
-interface CompactionMark {
-  at: string
-  compactionId?: string
-  candidates: { turn: number; toolCalls: number; errors: number; contextChars: number; estTokens: number; wasted?: boolean }[]
-}
-
 export function apply(ctx: Context, config: Config): void {
   console.log('[dsh-agent-skill-forge] apply', new Date().toISOString(), '(HMR probe)')
 
@@ -99,7 +102,7 @@ export function apply(ctx: Context, config: Config): void {
   // 本字段是「当前上下文占用」的诚实快照——上下文压力判断用这个，不跨轮累加。
   const contextPressureBySession = new Map<string, number>()
   // 炼化通知状态：sessionId → 下次通知阈值（步数/工具调用双轨独立推进——复合触发；2026-09-01 主人定调轮次轨改步数轨）
-  const notifyState = new Map<string, { nextStepThreshold: number; nextToolThreshold: number; notifiedCount: number }>
+  const notifyState = new Map<string, { nextStepThreshold: number; nextToolThreshold: number; notifiedCount: number }>()
   // 压缩轨迹标记：sessionId → 最近一次压缩的炼化候选标记
   const marksBySession = new Map<string, CompactionMark>()
   // 已知工具面（技能只提供指导、不提供工具——工具引用校验用）：
@@ -136,7 +139,7 @@ export function apply(ctx: Context, config: Config): void {
     }
     let idx = byTurn.get(turn)
     if (idx === undefined) {
-      idx = { turn, startAt: new Date().toISOString(), endAt: null, eventCount: 0, toolCalls: 0, errors: 0, estTokens: 0, contextChars: 0 }
+      idx = createTurnIndex(turn, new Date().toISOString())
       byTurn.set(turn, idx)
     }
     idx.eventCount += 1
@@ -148,8 +151,9 @@ export function apply(ctx: Context, config: Config): void {
       const text = msg !== undefined ? summarizeBlocks(msg) : ''
       idx.contextChars += text.length
     } else if (ev.type === 'turn/end') {
-      idx.endAt = new Date().toISOString()
-      if (config.persistIndex) persistIndex(session)
+      const nowIso = new Date().toISOString()
+      idx.endAt = nowIso
+      if (config.persistIndex) persistIndex(session, nowIso)
       maybeNotify(session, byTurn)
       // 压缩提醒（2026-09-14 主人定调默认关闭）：压缩已能轮内自办，不再需要催「先炼化再压缩」
       if (config.compactHintEnabled) maybeCompactHint(session, byTurn)
@@ -176,11 +180,7 @@ export function apply(ctx: Context, config: Config): void {
       // 压缩触发（此刻上下文最全）：计算炼化候选 → 打标记落盘（供压缩后炼化，单次压缩收益最大化）
       const byTurn2 = indexBySession.get(session.id)
       if (byTurn2 !== undefined && byTurn2.size > 0) {
-        const candidates = [...byTurn2.entries()]
-          .map(([turn, t]) => ({ turn, toolCalls: t.toolCalls, errors: t.errors, contextChars: t.contextChars, estTokens: t.estTokens, wasted: t.wasted ?? false }))
-          .filter((x) => (x.toolCalls >= 3 || x.errors > 0 || x.contextChars >= config.ctxSignalChars) && !x.wasted)
-          .sort((a, b) => (b.toolCalls + b.errors * 2) - (a.toolCalls + a.errors * 2))
-          .slice(0, 10)
+        const candidates = selectCompactionCandidates(byTurn2.entries(), config.ctxSignalChars)
         const mark: CompactionMark = { at: new Date().toISOString(), compactionId: String((ev.data as { compactionId?: string }).compactionId ?? ''), candidates }
         marksBySession.set(session.id, mark)
         persistMarks(session, mark)
@@ -188,10 +188,7 @@ export function apply(ctx: Context, config: Config): void {
       }
       // 压缩段重置（2026-08-23 修复）：压缩后上下文重置，本段起点 = 当前最大 turn，
       // hintState 清零让本段从 0 重新累计——不再被压缩前历史累计永久顶满（否则提醒永不再触发）
-      let segmentStart = 0
-      if (byTurn2 !== undefined) {
-        for (const turn of byTurn2.keys()) if (turn > segmentStart) segmentStart = turn
-      }
+      const segmentStart = byTurn2 === undefined ? 0 : maxTurn(byTurn2.keys())
       segmentBySession.set(session.id, segmentStart)
       hintState.set(session.id, 0)
       // 压缩后上下文重置：当前上下文压力清零（否则旧压力继续顶满提醒——主人 2026-08-24 修正）
@@ -199,47 +196,29 @@ export function apply(ctx: Context, config: Config): void {
     }
   })
 
-  // 索引文件路径：按 sessionId 独立（主人 2026-08-24 跨会话问题）——同一 cwd 下多个会话
-  // 共享一个 skill-forge-index.json 会互相覆盖（A 写 → B 覆盖 → A 重启后索引永久丢失）。
-  // 文件名带 sessionId 隔离；load 校验 sessionId 兜底。旧共享文件（无 sessionId 后缀）不再读写。
-  function indexFile(cwd: string, sessionId: string): string {
-    return join(cwd, '.dsh', 'skill-forge-index-' + sessionId + '.json')
-  }
-  function marksFile(cwd: string, sessionId: string): string {
-    return join(cwd, '.dsh', 'skill-forge-marks-' + sessionId + '.json')
-  }
-
-  function persistIndex(session: { id: string; header?: { cwd?: string } }): void {
-    try {
-      const cwd = session.header?.cwd
-      if (cwd === undefined) return
-      const byTurn = indexBySession.get(session.id)
-      if (byTurn === undefined) return
-      const dir = join(cwd, '.dsh')
-      mkdirSync(dir, { recursive: true })
-      const payload = {
-        sessionId: session.id,
-        updatedAt: new Date().toISOString(),
-        turns: [...byTurn.entries()].sort((a, b) => a[0] - b[0]).map(([, t]) => t),
-        // 通知/提示状态一并落盘（重启不丢提醒节流——否则重启后可能重复提醒，主人 2026-08-21 强调）
-        notify: notifyState.get(session.id) ?? null,
-        hint: hintState.get(session.id) ?? null,
-        // 压缩段起点落盘（重启不丢段边界——否则重启后段起点丢失、提醒统计错乱）
-        segment: segmentBySession.get(session.id) ?? null,
-      }
-      writeFileSync(indexFile(cwd, session.id), JSON.stringify(payload, null, 2), 'utf8')
-    } catch { /* 持久化失败静默 */ }
+  /** 索引/标记落盘（IO 薄壳吞错——失败不影响采集主流程） */
+  function persistIndex(session: { id: string; header?: { cwd?: string } }, nowIso: string): void {
+    const cwd = session.header?.cwd
+    if (cwd === undefined) return
+    const byTurn = indexBySession.get(session.id)
+    if (byTurn === undefined) return
+    const payload = {
+      sessionId: session.id,
+      updatedAt: nowIso,
+      turns: [...byTurn.entries()].sort((a, b) => a[0] - b[0]).map(([, t]) => t),
+      // 通知/提示状态一并落盘（重启不丢提醒节流——否则重启后可能重复提醒，主人 2026-08-21 强调）
+      notify: notifyState.get(session.id) ?? null,
+      hint: hintState.get(session.id) ?? null,
+      // 压缩段起点落盘（重启不丢段边界——否则重启后段起点丢失、提醒统计错乱）
+      segment: segmentBySession.get(session.id) ?? null,
+    }
+    writeJsonFile(skillIndexPath(cwd, session.id), payload)
   }
 
   function persistMarks(session: { id: string; header?: { cwd?: string } }, mark: CompactionMark): void {
-    try {
-      const cwd = session.header?.cwd
-      if (cwd === undefined) return
-      const dir = join(cwd, '.dsh')
-      mkdirSync(dir, { recursive: true })
-      const payload = { sessionId: session.id, ...mark }
-      writeFileSync(marksFile(cwd, session.id), JSON.stringify(payload, null, 2), 'utf8')
-    } catch { /* 持久化失败静默 */ }
+    const cwd = session.header?.cwd
+    if (cwd === undefined) return
+    writeJsonFile(skillMarksPath(cwd, session.id), { sessionId: session.id, ...mark })
   }
 
   // 重启恢复：进程内索引/标记是内存态，web 重启即失——工具首次使用时从磁盘懒加载
@@ -248,42 +227,18 @@ export function apply(ctx: Context, config: Config): void {
     try {
       const cwd = session.header?.cwd
       if (cwd === undefined) return undefined
-      const file = indexFile(cwd, session.id)
-      if (!existsSync(file)) return undefined
-      const data = JSON.parse(readFileSync(file, 'utf8')) as {
+      const data = readJsonFile(skillIndexPath(cwd, session.id)) as {
         sessionId?: string
         turns?: TurnIndex[]
-        notify?: { nextStepThreshold?: number; nextTurnThreshold?: number; nextThreshold?: number; nextToolThreshold?: number; notifiedCount?: number } | null
+        notify?: unknown
         hint?: number
         segment?: number | null
-      }
+      } | undefined
+      if (data === undefined) return undefined
       if (data.sessionId !== session.id) return undefined
       // 恢复通知/提示节流状态（重启不丢提醒时机——否则阈值回退、可能重复提醒）
-      // 2026-09-01 步数轨迁移（主人定调 200 步）：nextStepThreshold 一律重算 = 磁盘累计 steps（旧文件无字段=0）+ config，
-      // 不沿用旧轮次阈值（语义不同会错位）；工具轨语义不变，旧文件有则沿用。
-      // 2026-09-05 修复：重算只应在「旧文件无 notify 记录」时做（首次迁移）。
-      // 否则每次重启都把阈值推到 diskSteps+200——若上次推进过（无价值 +200）则阈值膨胀，
-      // 重启后实际 steps 永远差一截追不上 → 炼化提醒永不触发（实证：notifiedCount=0, 阈值 342 vs 实际 153）。
-      {
-        const diskSteps = (data.turns ?? []).reduce((s, t) => s + (t.steps ?? 0), 0)
-        const diskTools = (data.turns ?? []).reduce((s, t) => s + (t.toolCalls ?? 0), 0)
-        const n = data.notify
-        if (n !== undefined && n !== null && typeof n.nextStepThreshold === 'number' && n.nextStepThreshold > 0) {
-          // 已有阈值记录：沿用（重启不重置节流——避免阈值膨胀/重复提醒）
-          notifyState.set(session.id, {
-            nextStepThreshold: n.nextStepThreshold,
-            nextToolThreshold: (typeof n.nextToolThreshold === 'number' && n.nextToolThreshold > 0) ? n.nextToolThreshold : diskTools + config.notifyAfterTools,
-            notifiedCount: typeof n.notifiedCount === 'number' ? n.notifiedCount : 0,
-          })
-        } else {
-          // 首次/旧文件：按迁移规则初始化
-          notifyState.set(session.id, {
-            nextStepThreshold: diskSteps + config.notifyAfterSteps,
-            nextToolThreshold: diskTools + config.notifyAfterTools,
-            notifiedCount: 0,
-          })
-        }
-      }
+      // 2026-09-01 步数轨迁移 + 2026-09-05 膨胀修复：判据抽为 policy.migrateNotifyState（旧文件重算、已有记录沿用）
+      notifyState.set(session.id, migrateNotifyState(data.turns, data.notify, config))
       if (data.hint !== undefined && data.hint !== null) hintState.set(session.id, data.hint)
       // 恢复压缩段起点（旧文件无 segment 时保持 0 = 全量统计，兼容历史语义）
       if (data.segment !== undefined && data.segment !== null) segmentBySession.set(session.id, data.segment)
@@ -297,9 +252,8 @@ export function apply(ctx: Context, config: Config): void {
     try {
       const cwd = session.header?.cwd
       if (cwd === undefined) return undefined
-      const file = marksFile(cwd, session.id)
-      if (!existsSync(file)) return undefined
-      const data = JSON.parse(readFileSync(file, 'utf8')) as { sessionId?: string } & CompactionMark
+      const data = readJsonFile(skillMarksPath(cwd, session.id)) as ({ sessionId?: string } & CompactionMark) | undefined
+      if (data === undefined) return undefined
       if (data.sessionId !== session.id) return undefined
       return { at: data.at, compactionId: data.compactionId, candidates: data.candidates }
     } catch { return undefined }
@@ -321,9 +275,9 @@ export function apply(ctx: Context, config: Config): void {
     // 主人 2026-08-24：上下文压力 = 当前上下文占用（最新请求完整输入 token），
     // 不是「把所有轮次的上下文加在一起」。旧实现 `total += t.estTokens` 跨轮累加虚高。
     const total = contextPressureBySession.get(session.id) ?? 0
-    if (total < config.compactHintTokens) return
-    const lastHinted = hintState.get(session.id) ?? 0
-    if (lastHinted >= config.compactHintTokens && total - lastHinted < config.compactHintTokens * 0.3) return // 节流：同段不重复
+    // 阈值 + 节流判据抽为纯函数（policy.decideCompactHint，回归测试覆盖边界）
+    const decision = decideCompactHint({ total, lastHinted: hintState.get(session.id) ?? 0, threshold: config.compactHintTokens })
+    if (decision.action === 'skip') return
     const agent = ctx.agents?.get(session.id as never)
     if (agent === undefined) {
       // 诊断：agent 未找到（不推进状态，下次 turn/end 重试）
@@ -331,8 +285,8 @@ export function apply(ctx: Context, config: Config): void {
       return
     }
     // 计算当前候选数（供提示）
-    const candidates = [...byTurn.entries()].filter(([, t]) => (t.toolCalls >= 3 || t.errors > 0 || t.contextChars >= config.ctxSignalChars) && !t.wasted).length
-    const text = '[skill-forge] 上下文压力高（估算 ~' + Math.round(total / 1000) + 'k tokens）——压缩前建议先炼化：压缩前上下文最全，单次压缩收益最大化。skill_marks 查候选（当前 ' + candidates + ' 个），skill_extract 提取联动视图，skill_commit 写入 SKILL.md；炼化完再压缩。'
+    const candidates = countCandidateTurns(byTurn.values(), config.ctxSignalChars)
+    const text = buildCompactHintText({ total, candidates })
     const message = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'plugin', plugin: 'dsh-agent-skill-forge' } })
     // reenter 修复：延迟到当前 session.append 事务完成后投递
     setImmediate(() => {
@@ -344,7 +298,7 @@ export function apply(ctx: Context, config: Config): void {
         console.log('[dsh-agent-skill-forge] 压缩前提醒发送失败', session.id, String(err), new Date().toISOString())
         return
       }
-      hintState.set(session.id, total)
+      hintState.set(session.id, decision.hintValue)
     })
   }
 
@@ -357,37 +311,27 @@ export function apply(ctx: Context, config: Config): void {
   // 2026-09-01 主人定调：轮次轨改为**步数轨**（notifyAfterSteps=200）——step（一次完整思考+工具调用链）
   // 才是真实工作单元，一轮可含多步；计数点用 step/end（harness session-stats 官方口径）。
   function maybeNotify(session: { id: string }, byTurn: Map<number, TurnIndex>): void {
-    if (!config.notifyEnabled) return
-    const state = notifyState.get(session.id) ?? { nextStepThreshold: config.notifyAfterSteps, nextToolThreshold: config.notifyAfterTools, notifiedCount: 0 }
-    // 累计步数/工具调用 = 全会话所有轮之和（byTurn 跨压缩累积，不重置）
-    let totalSteps = 0
-    let totalTools = 0
-    for (const [, t] of byTurn) { totalSteps += t.steps ?? 0; totalTools += t.toolCalls }
-    // 复合触发：步数或工具调用任一达阈值即检查
-    if (totalSteps < state.nextStepThreshold && totalTools < state.nextToolThreshold) return
-    let hasValue = false
-    for (const [, t] of byTurn) {
-      if (t.errors > 0 || t.toolCalls >= 5 || t.contextChars >= config.ctxSignalChars) {
-        hasValue = true
-        break
-      }
-    }
-    if (!hasValue) {
+    const state = notifyState.get(session.id) ?? defaultNotifyState(config)
+    // 阈值/价值/推进判据抽为纯函数（policy.decideNotify + advanceNotifyState，回归测试覆盖边界）
+    const decision = decideNotify({ enabled: config.notifyEnabled, turns: [...byTurn.values()], state, cfg: config })
+    if (decision.action === 'skip') return
+    if (decision.action === 'silent') {
       // 无价值轮：双轨都推进（防止低价值会话反复检查空转）
-      state.nextStepThreshold = totalSteps + config.notifyAfterSteps
-      state.nextToolThreshold = totalTools + config.notifyAfterTools
-      notifyState.set(session.id, state)
+      notifyState.set(session.id, decision.silentState)
       return
     }
     const agent = ctx.agents?.get(session.id as never) // SessionId branded type 断言
     if (agent === undefined) {
       // 诊断：agent 未找到（不推进状态，下次 turn/end 重试）
-      console.log('[dsh-agent-skill-forge] 炼化通知跳过：agent 未找到', session.id, 'steps', totalSteps, 'tools', totalTools, new Date().toISOString())
+      console.log('[dsh-agent-skill-forge] 炼化通知跳过：agent 未找到', session.id, 'steps', decision.totalSteps, 'tools', decision.totalTools, new Date().toISOString())
       return
     }
-    let errorTurns = 0
-    for (const [, t] of byTurn) if (t.errors > 0) errorTurns += 1
-    const text = '[skill-forge] 已采集 ' + byTurn.size + ' 轮 / ' + totalSteps + ' 步轨迹 / 累计 ' + totalTools + ' 次工具调用（含 ' + errorTurns + ' 轮报错）——有高价值轮可炼化（蒸馏技能）。是否炼化、炼化哪些由爱丽丝决定：skill_signals 查看候选，skill_extract 提取，skill_commit 写入。'
+    const text = buildNotifyText({
+      turnCount: decision.turnCount,
+      totalSteps: decision.totalSteps,
+      totalTools: decision.totalTools,
+      errorTurns: decision.errorTurns,
+    })
     const message = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'plugin', plugin: 'dsh-agent-skill-forge' } })
     // reenter 修复（同 maybeCompactHint）：turn/end 回调内同步 agent.send 会触发 session.append reenter，
     // 延迟到当前 append 事务完成后投递；send 成功才推进状态
@@ -400,10 +344,7 @@ export function apply(ctx: Context, config: Config): void {
         console.log('[dsh-agent-skill-forge] 炼化通知发送失败', session.id, String(err), new Date().toISOString())
         return
       }
-      state.nextStepThreshold = totalSteps + config.notifyAfterSteps
-      state.nextToolThreshold = totalTools + config.notifyAfterTools
-      state.notifiedCount += 1
-      notifyState.set(session.id, state)
+      notifyState.set(session.id, advanceNotifyState(state, decision.totalSteps, decision.totalTools, config, true))
     })
   }
 
@@ -474,25 +415,10 @@ export function apply(ctx: Context, config: Config): void {
     async execute(args, exec) {
       const { byTurn } = turnsOf(exec)
       const limit = (args.limit as number | undefined) ?? 20
-      const turns = [...byTurn.entries()].sort((a, b) => b[0] - a[0]).slice(0, limit).map(([, t]) => ({
-        turn: t.turn,
-        startAt: t.startAt,
-        endAt: t.endAt ?? '', // 空串 = 进行中（lossless JSON：不可用 undefined）
-        eventCount: t.eventCount,
-        toolCalls: t.toolCalls,
-        errors: t.errors,
-        estTokens: t.estTokens,
-        wasted: t.wasted ?? false,
-      }))
-      let totalTokens = 0
-      let turnsWithErrors = 0
-      for (const [, t] of byTurn) {
-        totalTokens += t.estTokens
-        if (t.errors > 0) turnsWithErrors += 1
-      }
+      const view = buildSignalsView(byTurn.entries(), limit)
       return {
-        turns,
-        stats: { totalTurns: byTurn.size, totalTokens, turnsWithErrors },
+        turns: view.turns,
+        stats: view.stats,
         note: '按 turn 索引（完整事件在会话日志，零冗余）；报错轮是规避规则素材，平稳轮是泛化行为素材——判断归爱丽丝',
       }
     },
@@ -578,76 +504,30 @@ export function apply(ctx: Context, config: Config): void {
       },
     },
     async execute(args, exec) {
-      const { session, byTurn } = turnsOf(exec)
+      // turnsOf 调用保持原样（副作用：懒加载磁盘索引进内存）
+      const { session } = turnsOf(exec)
       if (session === undefined) return { segments: [], turnCount: 0, eventCount: 0, note: '无可用会话' }
       const start = args.startTurn as number
       const end = (args.endTurn as number | undefined) ?? start
       const maxChars = (args.maxChars as number | undefined) ?? 20000
       const linkContext = (args.linkContext as boolean | undefined) ?? true
-      // 联动视图：先聚合上下文特征段（该范围所有用户输入）
-      let contextChars = 0
-      const ctxLines: string[] = []
-      const lines: string[] = []
-      let eventCount = 0
       // 全量事件流提取（append-only 日志保留原始事件）：压缩只替换 surface 表层，
       // 原始事件仍在日志里——压缩标记的候选 turn 压缩后仍可提取
       // （原实现只遍历 surface.nodes，压缩后旧 turn 被替换出表层 → 提取失效，2026-08-21 修复）
       // alpha.4 适配（2026-09-06）：Session.events 已移除，改经 seq + eventAt 按需读日志。
       const sessionView = session as unknown as {
         seq: number
-        eventAt(seq: number): {
-          type?: string
-          data?: {
-            turn?: number
-            message?: Message
-            name?: string
-            arguments?: string
-            error?: unknown
-          }
-        } | undefined
+        eventAt(seq: number): ExtractEvent | undefined
       }
-      for (let i = 0; i < sessionView.seq; i += 1) {
-        const event = sessionView.eventAt(i)
-        if (event === undefined) continue
-        const turn = event.data?.turn
-        if (turn === undefined || turn < start || turn > end) continue
-        eventCount += 1
-        const t = event.type
-        const d = event.data
-        if (d === undefined) continue
-        if (t === 'user/message') {
-          const text = d.message !== undefined ? summarizeBlocks(d.message) : ''
-          contextChars += text.length
-          if (linkContext) ctxLines.push('[上下文特征] ' + truncate(text, 400))
-        } else if (t === 'assistant/message') {
-          const text = d.message !== undefined ? summarizeBlocks(d.message) : ''
-          lines.push('[assistant] ' + truncate(text, 300))
-        } else if (t === 'tool/call') {
-          lines.push('[tool-call] ' + String(d.name ?? '?') + '(' + truncate(String(d.arguments ?? ''), 200) + ')')
-        } else if (t === 'tool/result') {
-          const err = d.error !== undefined
-          const text = d.message !== undefined ? summarizeBlocks(d.message) : ''
-          lines.push(err ? '[tool-result ERROR] ' + truncate(text, 300) : '[tool-result] ' + truncate(text, 300))
-        }
-      }
-      // 联动：上下文特征段放在最前（「触发条件」先行），后接应对轨迹（交错）
-      const allLines = linkContext && ctxLines.length > 0 ? [...ctxLines, '--- 应对轨迹 ---', ...lines] : lines
-      const segments: string[] = []
-      let current = ''
-      for (const line of allLines) {
-        if (current.length + line.length + 1 > maxChars) {
-          segments.push(current)
-          current = line
-        } else {
-          current = current.length === 0 ? line : current + '\n' + line
-        }
-      }
-      if (current.length > 0) segments.push(current)
+      const events: (ExtractEvent | undefined)[] = []
+      for (let i = 0; i < sessionView.seq; i += 1) events.push(sessionView.eventAt(i))
+      // 联动视图构建抽为纯函数（aggregate.buildExtractView，回归测试覆盖分段边界与脏事件）
+      const view = buildExtractView({ events, start, end, maxChars, linkContext })
       return {
-        segments,
-        turnCount: end - start + 1,
-        eventCount,
-        contextChars,
+        segments: view.segments,
+        turnCount: view.turnCount,
+        eventCount: view.eventCount,
+        contextChars: view.contextChars,
         note: '联动视图：上下文特征（触发条件）在前，应对轨迹在后——蒸馏「上下文特征 → 应对策略」条件化技能；成败判断归爱丽丝',
       }
     },
@@ -681,8 +561,9 @@ export function apply(ctx: Context, config: Config): void {
       const description = (args.description as string | undefined) ?? ''
       const body = (args.body as string | undefined) ?? ''
       const scope = (args.scope as 'user' | 'project' | undefined) ?? 'user'
-      if (name.length === 0 || !/^[a-z0-9][a-z0-9-]*$/.test(name)) return { path: '', name, note: '技能名必须为小写 kebab-case（如 alpha-refine）' }
-      if (description.length === 0 || body.length === 0) return { path: '', name, note: 'description 与 body 不能为空' }
+      // 输入校验抽为纯函数（policy.validateSkillCommit：早退顺序 = 先名字后正文）
+      const validity = validateSkillCommit({ name, description, body })
+      if (!validity.ok) return { path: '', name, note: validity.note }
       let root: string
       if (scope === 'user') {
         root = join(process.env.DSH_AGENTS_HOME ?? join(homedir(), '.agents'), 'skills')
@@ -708,15 +589,12 @@ export function apply(ctx: Context, config: Config): void {
             marked += 1
           }
         }
-        if (marked > 0 && exec.agent?.session !== undefined) persistIndex(exec.agent.session)
+        if (marked > 0 && exec.agent?.session !== undefined) persistIndex(exec.agent.session, new Date().toISOString())
       }
       // 工具引用校验（技能只提供指导、不提供工具）：正文引用的工具必须属于系统工具面
       const toolRefs = extractToolRefs(body)
       const unknownTools = toolRefs.filter((t) => !knownTools.has(t))
-      let note = 'SKILL.md 已写入；新会话技能目录自动发现（dsh-skill-filesystem）。已炼化轨迹 ' + turns.length + ' 轮标记为废渣，不再重复提示'
-      if (unknownTools.length > 0) {
-        note += '。\n⚠ 工具引用校验：以下工具不在已知工具面，可能是幻觉工具（技能只提供指导，不提供工具）：' + unknownTools.join(', ')
-      }
+      const note = buildCommitNote(turns.length, unknownTools)
       // 技能要点回流主记忆库（2026-09-06 第二批）：SKILL.md 已落盘，同时把技能索引进记忆——recall 技能名可命中。
       // memoryApi 可选（dsh-agent-memory 未挂载/失败静默跳过，SKILL.md 仍是权威存储）。
       try {
@@ -735,37 +613,4 @@ export function apply(ctx: Context, config: Config): void {
   ctx.tools.register(extractTool)
   ctx.tools.register(commitTool)
   ctx.logger('dsh-agent-skill-forge').info('ready（skill_signals / skill_marks / skill_extract / skill_commit 已注册——被动形态，决策归爱丽丝）')
-}
-
-/** 消息内容摘要（text 块拼接截断） */
-function summarizeBlocks(message: Message): string {
-  const parts: string[] = []
-  for (const block of message.content) {
-    if (block.type === 'text') parts.push(block.text)
-    else if (block.type === 'tool-result') parts.push('[tool-result ' + String((block as { content?: unknown[] }).content?.length ?? 0) + ' blocks]')
-    else parts.push('[' + block.type + ']')
-  }
-  return parts.join('\n')
-}
-
-/**
- * 提取文本中的工具引用：反引号内标识符 + 「工具：xxx」模式。
- * 技能只提供指导、不提供工具（SkillForge 约束版定义）——引用的工具必须是系统工具面已有能力。
- */
-function extractToolRefs(text: string): string[] {
-  const refs = new Set<string>()
-  // 反引号内的小写标识符（代码/工具引用惯用）：`wq_simulate`
-  const backtick = text.match(/`([a-z][a-z0-9_]{2,40})`/g)
-  if (backtick) for (const m of backtick) refs.add(m.slice(1, -1))
-  // 「工具：xxx」或「工具:xxx」模式
-  const colon = text.match(/工具[:：]\s*([a-z][a-z0-9_]{2,40})/g)
-  if (colon) for (const m of colon) {
-    const name = m.split(/[:：]/)[1]?.trim()
-    if (name !== undefined) refs.add(name)
-  }
-  return [...refs]
-}
-
-function truncate(text: string, n: number): string {
-  return text.length <= n ? text : text.slice(0, n) + '…'
 }
