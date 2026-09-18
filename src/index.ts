@@ -37,8 +37,10 @@ import {
   decideNotify,
   defaultNotifyState,
   migrateNotifyState,
+  resolveSkillKind,
   validateSkillCommit,
 } from './policy.js'
+import type { SkillKind } from './policy.js'
 import {
   buildExtractView,
   buildSignalsView,
@@ -52,10 +54,13 @@ import {
   buildCommitNote,
   buildCompactHintText,
   buildNotifyText,
+  buildToolCandidateNote,
+  countConcreteSnippets,
+  countNumberedSteps,
   extractToolRefs,
   summarizeBlocks,
 } from './text.js'
-import { readJsonFile, skillIndexPath, skillMarksPath, writeJsonFile } from './trace-store.js'
+import { readJsonFile, skillIndexPath, skillMarksPath, skillToolsPath, writeJsonFile } from './trace-store.js'
 
 export const name = 'agent-skill-forge'
 export const inject = ['tools', 'agents', 'memoryApi'] as const
@@ -91,6 +96,28 @@ export const Config = z.object({
   notifyAfterSteps: z.number().step(1).min(1).default(200),
   notifyAfterTools: z.number().step(1).min(1).default(200),
 })
+
+/**
+ * 工具候选（`kind=tool` 的产物）。
+ * 跨会话累积在 `<cwd>/.dsh/skill-forge-tools.json`——「这个反复手写的脚本该固化成工具」是
+ * 一个**跨会话的意图**，不能随会话结束蒸发（索引/标记是会话旁路产物，故按 sessionId 隔离；
+ * 台账是熔炉的产出，故不隔离——两者的隔离维度按语义决定）。
+ */
+interface ToolCandidate {
+  /** 拟固化的工具名（台账主键） */
+  tool: string
+  /** 拟归属的插件包名 */
+  plugin: string
+  /** 登记它的技能名（人读线索） */
+  skill: string
+  /** 为什么值得固化（来自 skill_commit 的 body） */
+  why: string
+  status: 'candidate' | 'forged' | 'abandoned'
+  /** 支撑它的轨迹轮次 */
+  turns: number[]
+  createdAt: string
+  updatedAt: string
+}
 
 export function apply(ctx: Context, config: Config): void {
   console.log('[dsh-agent-skill-forge] apply', new Date().toISOString(), '(HMR probe)')
@@ -536,13 +563,16 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- 工具 3：skill_commit ----------
   const commitTool: ToolDefinition = defineTool({
     name: 'skill_commit',
-    description: '写入技能（可写）：把蒸馏出的技能保存为 SKILL.md（YAML frontmatter + 正文）——默认写用户级 ~/.agents/skills/<name>/SKILL.md（跨项目可加载），scope=project 写 <cwd>/.agents/skills/。纪律：技能只提供指导（决策/流程/规避），不提供工具——工具引用限于系统工具面（提交时自动校验，幻觉工具会警告）。',
+    description: '把轨迹蒸馏产物落盘（可写）。产物类型由 kind 决定（2026-09-16 语义扩充）：guidance=条件化行为规则 → SKILL.md；workflow=**具体**高效工作流（需 ≥2 条编号步骤 + ≥1 处可执行片段）→ SKILL.md（frontmatter 带 kind）；tool=该固化的插件工具 → 工具候选台账（不写 SKILL.md——工具的载体是插件，不是技能目录）。guidance/workflow 默认写用户级 ~/.agents/skills/<name>/SKILL.md（跨项目可加载），scope=project 写 <cwd>/.agents/skills/。纪律：技能只提供指导（决策/流程/规避），不提供工具——正文引用的工具限于系统工具面（提交时自动校验，幻觉工具会警告）。turns 声明的轮次提交后标记为废渣。',
     parameters: {
       name: { type: 'string', required: true, description: '技能名（小写 kebab-case，如 alpha-refine）' },
       description: { type: 'string', required: true, description: '一句话描述（frontmatter description；技能目录显示用）' },
-      body: { type: 'string', required: true, description: '技能正文（Markdown；条件化行为规则——在什么状态下做什么/规避什么）' },
+      body: { type: 'string', required: true, description: '正文（Markdown）。guidance=条件化行为规则（什么状态下做什么/规避什么）；workflow=具体步骤序列（编号步骤 + 命令/调用）；tool=为什么要固化这个工具' },
       scope: { type: 'string', enum: ['user', 'project'], description: '写入范围（缺省 user=~/.agents/skills）' },
       turns: { type: 'array', items: { type: 'number' }, description: '本次炼化覆盖的 turn 列表（可选）——提交后这些轨迹标记为废渣，信号/候选不再重复提示' },
+      kind: { type: 'string', enum: ['guidance', 'workflow', 'tool'], description: '产物类型（缺省 guidance=原语义，不变）' },
+      toolName: { type: 'string', description: 'kind=tool 必需：拟固化的工具名（小写字母开头，仅 [a-z0-9_]）' },
+      toolPlugin: { type: 'string', description: 'kind=tool 必需：拟归属的插件包名（小写 kebab，如 dsh-earn-radar）' },
     },
     output: {
       schema: {
@@ -554,33 +584,36 @@ export function apply(ctx: Context, config: Config): void {
           note: { type: 'string', required: true },
         },
       },
-      render: (args, value) => [{ type: 'text', text: '技能已写入 ' + value.path }],
+      render: (args, value) => [{ type: 'text', text: value.path.length > 0 ? ('技能已写入 ' + value.path + '\n' + value.note) : value.note }],
     },
     async execute(args, exec) {
       const name = (args.name as string | undefined) ?? ''
       const description = (args.description as string | undefined) ?? ''
       const body = (args.body as string | undefined) ?? ''
       const scope = (args.scope as 'user' | 'project' | undefined) ?? 'user'
-      // 输入校验抽为纯函数（policy.validateSkillCommit：早退顺序 = 先名字后正文）
-      const validity = validateSkillCommit({ name, description, body })
-      if (!validity.ok) return { path: '', name, note: validity.note }
-      let root: string
-      if (scope === 'user') {
-        root = join(process.env.DSH_AGENTS_HOME ?? join(homedir(), '.agents'), 'skills')
-      } else {
-        const cwd = exec.agent?.session.header?.cwd
-        if (cwd === undefined) return { path: '', name, note: '无会话 cwd，无法写项目级技能（改用 scope=user）' }
-        root = join(cwd, '.agents', 'skills')
-      }
-      const dir = join(root, name)
-      mkdirSync(dir, { recursive: true })
-      const frontmatter = '---\nname: ' + name + '\ndescription: ' + description.replace(/\n/g, ' ') + '\n---\n\n'
-      const path = join(dir, 'SKILL.md')
-      writeFileSync(path, frontmatter + body + '\n', 'utf8')
-      // 废渣标记：本次炼化覆盖的 turn → wasted（信号/候选不再重复提示）
+      const kindRaw = args.kind as string | undefined
+      const kind: SkillKind = resolveSkillKind(kindRaw) ?? 'guidance'
+      const toolName = (args.toolName as string | undefined) ?? ''
+      const toolPlugin = (args.toolPlugin as string | undefined) ?? ''
       const turns = (args.turns as number[] | undefined) ?? []
-      const byTurn = exec.agent?.session === undefined ? undefined : indexBySession.get(exec.agent.session.id)
-      if (byTurn !== undefined && turns.length > 0) {
+      // 输入校验抽为纯函数（policy.validateSkillCommit）：早退顺序 = 名字 → kind → kind 专属 → 正文
+      const validity = validateSkillCommit({
+        name,
+        description,
+        body,
+        kind: kindRaw,
+        toolName,
+        toolPlugin,
+        numberedSteps: countNumberedSteps(body),
+        concreteSnippets: countConcreteSnippets(body),
+      })
+      if (!validity.ok) return { path: '', name, note: validity.note }
+      // 废渣标记（三类产物共用）：本次炼化覆盖的 turn → wasted（信号/候选不再重复提示）
+      const markWasted = (): void => {
+        const sess = exec.agent?.session
+        if (sess === undefined || turns.length === 0) return
+        const byTurn = indexBySession.get(sess.id)
+        if (byTurn === undefined) return
         let marked = 0
         for (const t of turns) {
           const idx = byTurn.get(t)
@@ -589,12 +622,56 @@ export function apply(ctx: Context, config: Config): void {
             marked += 1
           }
         }
-        if (marked > 0 && exec.agent?.session !== undefined) persistIndex(exec.agent.session, new Date().toISOString())
+        if (marked > 0) persistIndex(sess, new Date().toISOString())
       }
+      const cwd = exec.agent?.session.header?.cwd
+
+      // ── kind=tool：登记**工具候选台账**（不写 SKILL.md——工具的载体是插件）────────
+      if (kind === 'tool') {
+        if (cwd === undefined) return { path: '', name, note: '无会话 cwd，无法写工具候选台账' }
+        const file = skillToolsPath(cwd)
+        const reg = (readJsonFile(file) as { candidates?: Record<string, ToolCandidate> } | undefined) ?? {}
+        const candidates = reg.candidates ?? {}
+        const existed = candidates[toolName] !== undefined
+        const prev = candidates[toolName]
+        const nowIso = new Date().toISOString()
+        candidates[toolName] = {
+          tool: toolName,
+          plugin: toolPlugin,
+          skill: name,
+          why: body.trim(),
+          status: prev?.status ?? 'candidate',
+          turns: [...new Set([...(prev?.turns ?? []), ...turns])].sort((a, b) => a - b),
+          createdAt: prev?.createdAt ?? nowIso,
+          updatedAt: nowIso,
+        }
+        const ok = writeJsonFile(file, { updatedAt: nowIso, candidates })
+        // 显式写入必须 fail-loud：失败就**不能说已落盘**（§5.9「返回 ok 不是证据」）
+        if (!ok) return { path: '', name, note: '工具候选台账写入失败（' + file + '）——产物未落盘，检查路径权限后重试' }
+        markWasted()
+        return { path: file, name, note: buildToolCandidateNote({ tool: toolName, plugin: toolPlugin, turnsRequested: turns.length, existed }) }
+      }
+
+      // ── kind=guidance | workflow：写 SKILL.md ────────────────────────────────
+      let root: string
+      if (scope === 'user') {
+        root = join(process.env.DSH_AGENTS_HOME ?? join(homedir(), '.agents'), 'skills')
+      } else {
+        if (cwd === undefined) return { path: '', name, note: '无会话 cwd，无法写项目级技能（改用 scope=user）' }
+        root = join(cwd, '.agents', 'skills')
+      }
+      const dir = join(root, name)
+      mkdirSync(dir, { recursive: true })
+      // kind 只在非缺省时写入 frontmatter ⇒ guidance 产物与扩充前**逐字节相同**（向后兼容硬约束）
+      const kindLine = kind === 'guidance' ? '' : 'kind: ' + kind + '\n'
+      const frontmatter = '---\nname: ' + name + '\ndescription: ' + description.replace(/\n/g, ' ') + '\n' + kindLine + '---\n\n'
+      const path = join(dir, 'SKILL.md')
+      writeFileSync(path, frontmatter + body + '\n', 'utf8')
+      markWasted()
       // 工具引用校验（技能只提供指导、不提供工具）：正文引用的工具必须属于系统工具面
       const toolRefs = extractToolRefs(body)
       const unknownTools = toolRefs.filter((t) => !knownTools.has(t))
-      const note = buildCommitNote(turns.length, unknownTools)
+      const note = buildCommitNote(turns.length, unknownTools, kind)
       // 技能要点回流主记忆库（2026-09-06 第二批）：SKILL.md 已落盘，同时把技能索引进记忆——recall 技能名可命中。
       // memoryApi 可选（dsh-agent-memory 未挂载/失败静默跳过，SKILL.md 仍是权威存储）。
       try {
@@ -608,9 +685,74 @@ export function apply(ctx: Context, config: Config): void {
     },
   })
 
+  // ---------- 工具 4：skill_tools（工具候选台账 · 2026-09-16 语义扩充）----------
+  const toolsTool: ToolDefinition = defineTool({
+    name: 'skill_tools',
+    description: '工具候选台账（读 + 流转）：skill_commit(kind=tool) 的产物——「这个反复手写的脚本该固化成哪个插件工具」。不传 tool 列出全部候选（含状态计数）；只传 tool 看详情；传 tool + status/plugin/note 则流转该候选（candidate → forged/abandoned）。台账**跨会话累积**（<cwd>/.dsh/skill-forge-tools.json），不随会话结束蒸发。',
+    parameters: {
+      tool: { type: 'string', description: '工具名（不传=列全部）' },
+      status: { type: 'string', enum: ['candidate', 'forged', 'abandoned'], description: '流转到的状态（须与 tool 同传）' },
+      plugin: { type: 'string', description: '修正归属插件包名（须与 tool 同传）' },
+      note: { type: 'string', description: '补充说明（追加到 why；须与 tool 同传）' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { text: { type: 'string', required: true } },
+      },
+      render: (args, value) => [{ type: 'text', text: String(value.text ?? '') }],
+    },
+    async execute(args, exec) {
+      const cwd = exec.agent?.session.header?.cwd
+      if (cwd === undefined) return { text: '(无会话 cwd，读不到工具候选台账)' }
+      const file = skillToolsPath(cwd)
+      const reg = (readJsonFile(file) as { candidates?: Record<string, ToolCandidate> } | undefined) ?? {}
+      const candidates = reg.candidates ?? {}
+      const names = Object.keys(candidates).sort()
+      const tool = (args.tool as string | undefined) ?? ''
+      if (tool === '') {
+        if (names.length === 0) {
+          return { text: '(工具候选台账为空：' + file + ')\n——把「这个脚本该固化成工具」的轨迹用 skill_commit(kind=\'tool\', toolName=…, toolPlugin=…) 登记进来' }
+        }
+        const counts: Record<string, number> = { candidate: 0, forged: 0, abandoned: 0 }
+        for (const n of names) {
+          const c = candidates[n]
+          if (c !== undefined) counts[c.status] = (counts[c.status] ?? 0) + 1
+        }
+        const lines = names.map((n) => {
+          const c = candidates[n] as ToolCandidate
+          return '• ' + c.tool + ' → ' + c.plugin + ' [' + c.status + '] turns=' + c.turns.length + ' · ' + c.why.slice(0, 70).replace(/\n/g, ' ')
+        })
+        return { text: '工具候选台账（' + names.length + '：candidate ' + (counts.candidate ?? 0) + ' / forged ' + (counts.forged ?? 0) + ' / abandoned ' + (counts.abandoned ?? 0) + '）\n' + lines.join('\n') + '\n\n台账文件：' + file }
+      }
+      const cur = candidates[tool]
+      if (cur === undefined) return { text: '(无候选工具 \'' + tool + '\'；现有：' + (names.join(', ') || '无') + ')' }
+      const wantStatus = args.status as ToolCandidate['status'] | undefined
+      const wantPlugin = args.plugin as string | undefined
+      const wantNote = args.note as string | undefined
+      if (wantStatus === undefined && wantPlugin === undefined && wantNote === undefined) {
+        return { text: JSON.stringify(cur, null, 1) + '\n\n台账文件：' + file }
+      }
+      const nowIso = new Date().toISOString()
+      const next: ToolCandidate = {
+        ...cur,
+        status: wantStatus ?? cur.status,
+        plugin: wantPlugin ?? cur.plugin,
+        why: wantNote !== undefined ? (cur.why + '\n\n' + wantNote) : cur.why,
+        updatedAt: nowIso,
+      }
+      candidates[tool] = next
+      const ok = writeJsonFile(file, { updatedAt: nowIso, candidates })
+      if (!ok) return { text: '台账写入失败（' + file + '）——状态未流转' }
+      return { text: '已更新 ' + tool + ': status=' + next.status + ' plugin=' + next.plugin + '\n' + JSON.stringify(next, null, 1) }
+    },
+  })
+
   ctx.tools.register(signalsTool)
   ctx.tools.register(marksTool)
   ctx.tools.register(extractTool)
   ctx.tools.register(commitTool)
-  ctx.logger('dsh-agent-skill-forge').info('ready（skill_signals / skill_marks / skill_extract / skill_commit 已注册——被动形态，决策归爱丽丝）')
+  ctx.tools.register(toolsTool)
+  ctx.logger('dsh-agent-skill-forge').info('ready（skill_signals / skill_marks / skill_extract / skill_commit / skill_tools 已注册——被动形态，决策归爱丽丝）')
 }

@@ -26,6 +26,17 @@ export function skillMarksPath(cwd: string, sessionId: string): string {
 }
 
 /**
+ * 工具候选台账路径（**故意不按 sessionId 隔离**）。
+ *
+ * 2026-09-16 主人定调「扩充语义包括插件工具」：一个「这个脚本该固化成工具」的意图是
+ * **跨会话累积的资产**——按会话隔离会让它随会话结束蒸发，与台账的意义相悖。
+ * 索引/标记是会话的旁路产物（须隔离），台账是熔炉的产出（须累积）——两者的隔离维度不同。
+ */
+export function skillToolsPath(cwd: string): string {
+  return join(cwd, '.dsh', 'skill-forge-tools.json')
+}
+
+/**
  * 写 JSON（自动建父目录；2 空格缩进）。
  * @returns true = 已写入；false = 失败（不可写路径 / 序列化失败——吞错，不抛）
  */

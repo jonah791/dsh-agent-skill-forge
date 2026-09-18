@@ -1,25 +1,41 @@
 <!--
   DSH 插件生态公约声明（plugin-ecosystem-convention · 组合优先/声明清晰/兼容优先）
-  purpose: 被动技能熔炉（Trace2Skill / Ctx2Skill 落地）——后台采集会话轨迹索引（零 LLM 成本）+ 阈值信号送达 + 压缩时刻打炼化候选标记；蒸馏/合并/剪枝决策归爱丽丝；产出 DSH 技能目录原生可加载的 SKILL.md
+  purpose: 被动技能熔炉（Trace2Skill / Ctx2Skill 落地）——后台采集会话轨迹索引（零 LLM 成本）+ 阈值信号送达 + 压缩时刻打炼化候选标记；蒸馏/合并/剪枝决策归爱丽丝；产物三态：guidance/workflow → DSH 技能目录原生可加载的 SKILL.md，tool → 跨会话累积的工具候选台账
   inject: 'tools','agents','memoryApi'
-  tools: skill_signals, skill_marks, skill_extract, skill_commit
+  tools: skill_signals, skill_marks, skill_extract, skill_commit, skill_tools
   runtime: host-only
   envDeps: 无强依赖（纯逻辑 + 标准 Node）；可选：dsh-agent-memory（memoryApi 缺省时技能索引回流被静默跳过，SKILL.md 仍是权威存储）
-  boundary: 只采集与建议，**不蒸馏、不合并、不自动写技能**（唯一写动作是 skill_commit，需显式调用）；工具引用校验只覆盖「系统工具面 + 本进程见过的工具」
+  boundary: 只采集与建议，**不蒸馏、不合并、不自动写产物**（写动作只有两处且都需显式调用：skill_commit 落产物、skill_tools 流转候选状态）；工具引用校验只覆盖「系统工具面 + 本进程见过的工具」
   compat: cordis ^4.0.1 / schemastery ^3.18.1-rc.1 / dsh-tools ^0.1.0-rc.6 / dsh-llm ^0.1.0-rc.6 / dsh-session ^0.1.0-rc.6
 -->
 # dsh-agent-skill-forge
 
 <p align="center">
-  <a href="https://github.com/jonah791/dsh-agent-skill-forge"><img src="https://img.shields.io/badge/version-0.1.1-blue" alt="version"></a>
+  <a href="https://github.com/jonah791/dsh-agent-skill-forge"><img src="https://img.shields.io/badge/version-0.2.0-blue" alt="version"></a>
   <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
-  <img src="https://img.shields.io/badge/tests-86%20passed-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/tests-98%20passed-brightgreen" alt="tests">
 </p>
 
-**一句话**：把「这次会话里踩过的坑、验证过的流程」变成下次能直接加载的 `SKILL.md`——插件只做**采集与提示**，蒸馏与写入由 agent 本人决定。
+**一句话**：把「这次会话里踩过的坑、验证过的流程、该固化的那个脚本」变成下次能直接用的资产——**指导**写成 `SKILL.md`、**具体工作流**写成带步骤与命令的 `SKILL.md`、**工具**登记进工具候选台账等 `plugin_forge` 成形。熔炉只做**采集与落盘**，蒸馏与写入由 agent 本人决定。
 
-**为什么值得用**：经验不落盘就等于没学到——压缩一过，路径、报错、绕法全蒸发。本插件在后台**零 LLM 成本**地给每一轮轨迹建索引（事件数/工具调用/报错/上下文规模），在轨迹够厚时把信号送到你面前，并**在压缩发生的那一刻**（此刻上下文最全）把高价值候选轮打上标记落盘——压缩后按标记蒸馏，单次压缩的收益最大化。它只提醒，不替你决定蒸馏什么、何时蒸馏、怎么写。
+**为什么值得用**：经验不落盘就等于没学到——压缩一过，路径、报错、绕法全蒸发。本插件在后台**零 LLM 成本**地给每一轮轨迹建索引（事件数/工具调用/报错/上下文规模/步数），在轨迹够厚时把信号送到你面前，并**在压缩发生的那一刻**（此刻上下文最全）把高价值候选轮打上标记落盘——压缩后按标记蒸馏，单次压缩的收益最大化。它只提醒，不替你决定蒸馏什么、何时蒸馏、写成什么形态。
+
+## 产物三态（v0.2.0 语义扩充）
+
+熔炉的产物**不止一种**。按**载体**分三类——载体不同，判据不同，落点不同：
+
+| `kind` | 是什么 | 载体 / 落点 | 结构判据（提交时自动校验，不达即拒） |
+|--------|--------|------------|-----------------------------------|
+| `guidance`（缺省） | 条件化行为规则：什么状态下做什么/规避什么 | `SKILL.md`（技能目录，被自动加载） | description 与 body 非空 —— **原语义，逐字不变** |
+| `workflow` | **具体**的高效工作流：编号步骤 + 可执行片段 | `SKILL.md`（frontmatter 带 `kind:`） | ≥2 条编号步骤 **且** ≥1 处可执行片段（代码块或 `行内代码`） |
+| `tool` | 该固化的**插件工具**：「这个反复手写的脚本该变成哪个插件」 | **工具候选台账** `<cwd>/.dsh/skill-forge-tools.json`（**不写 SKILL.md**） | `toolName`（`[a-z][a-z0-9_]*`）+ `toolPlugin`（小写 kebab） |
+
+**为什么 `tool` 不写 SKILL.md**：技能的载体是技能目录（一份被模型**读到**的指导）；工具的载体是**插件**（README / docs / 版本 / 测试 / 组合行，要被**执行**到）。把工具塞进技能目录，等于让它只能被读到、不能被调用——这正是 v0.2.0 要扩掉的旧语义。
+
+**为什么台账不按 sessionId 隔离**：索引/标记是**会话的旁路产物**（隔离防互相覆盖）；工具候选是**熔炉的产出**——「这个脚本该固化成工具」是一个跨会话的意图，按会话隔离会让它随会话结束蒸发。**隔离维度按语义决定，不按习惯。**
+
+**向后兼容是硬约束**：不传 `kind`（或显式 `guidance`）时，校验判定与产出的 `SKILL.md` **逐字节不变**（`kind:` 行只在非 `guidance` 时写入）。
 
 ## 能力
 
@@ -27,8 +43,9 @@
 |------|--------------------------|
 | `skill_signals` | 技能熔炉信号（只读）：本会话轨迹轮次索引——每轮的事件数/工具调用数/报错数/估算 token。选候选轮次后用 `skill_extract` 提取轨迹分析。决策（蒸馏什么/何时蒸馏）归爱丽丝。`limit` 取最近 N 轮（缺省 20） |
 | `skill_marks` | 压缩轨迹标记（只读）：最近一次压缩触发时标记的炼化候选 turn（含工具调用/报错/上下文规模特征）——压缩前上下文最全时刻的高价值轨迹，压缩后按此炼化收益最大化。只读信号，炼化决策归爱丽丝 |
-| `skill_extract` | 提取轨迹（只读）：按 turn 范围从会话事件流提取事件序列文本（用户消息/模型动作/工具调用/结果与错误），供爱丽丝蒸馏分析。零 LLM 调用（纯数据提取）。`linkContext=true`（缺省）时输出联动视图——显式标注「上下文特征」段与应对轨迹交错呈现，供蒸馏「上下文特征 → 应对策略」的条件化技能。`startTurn` 必需；`endTurn` 缺省 = `startTurn`；`maxChars` 缺省 20000（超长分段返回） |
-| `skill_commit` | 写入技能（**可写**）：把蒸馏出的技能保存为 SKILL.md（YAML frontmatter + 正文）——默认写用户级技能目录（跨项目可加载），`scope=project` 写 `<cwd>/.agents/skills/`。纪律：技能只提供指导（决策/流程/规避），不提供工具——工具引用限于系统工具面（提交时自动校验，幻觉工具会警告）。`turns` 声明本次炼化覆盖的轮次 → 提交后标为**废渣**，信号/候选不再重复提示 |
+| `skill_extract` | 提取轨迹（只读）：按 turn 范围从会话事件流提取事件序列文本（用户消息/模型动作/工具调用/结果与错误），供爱丽丝蒸馏分析。零 LLM 调用（纯数据提取）。`linkContext=true`（缺省）时输出联动视图，供蒸馏「上下文特征 → 应对策略」条件化技能。`startTurn` 必需；`endTurn` 缺省 = `startTurn`；`maxChars` 缺省 20000（超长分段返回） |
+| `skill_commit` | 把轨迹蒸馏产物落盘（**可写**）。产物类型由 `kind` 决定：`guidance` → SKILL.md；`workflow` → SKILL.md（frontmatter 带 kind）；`tool` → 工具候选台账。guidance/workflow 默认写 `~/.agents/skills/<name>/SKILL.md`，`scope=project` 写 `<cwd>/.agents/skills/`。纪律：技能只提供指导（决策/流程/规避），不提供工具——正文引用的工具限于系统工具面（提交时自动校验，幻觉工具会警告）。`turns` 声明的轮次提交后标记为**废渣** |
+| `skill_tools` | 工具候选台账（读 + 流转）：`skill_commit(kind=tool)` 的产物。不传 `tool` 列全部候选（含状态计数）；只传 `tool` 看详情；传 `tool` + `status`/`plugin`/`note` 则流转该候选（`candidate` → `forged`/`abandoned`）。台账**跨会话累积**，不随会话结束蒸发 |
 
 背景行为（无工具面，自动发生）：
 
@@ -92,6 +109,7 @@ cd self-plugins/dsh-agent-skill-forge && npm install && npm run build && npm tes
 |------|------|------|
 | `<工作区>/.dsh/skill-forge-index-<sessionId>.json` | 本插件 | 轨迹索引：逐 turn 的 `eventCount` / `toolCalls` / `errors` / `estTokens` / `contextChars` / `wasted`（废渣标记）+ 通知阈值推进状态。**按 `sessionId` 隔离**——同一 cwd 多会话共用一个文件会互相覆盖（A 写 → B 覆盖 → A 重启后索引永久丢失） |
 | `<工作区>/.dsh/skill-forge-marks-<sessionId>.json` | 本插件 | 最近一次压缩打下的炼化候选标记：`{ at, compactionId, candidates[] }` |
+| `<工作区>/.dsh/skill-forge-tools.json` | `skill_commit`(kind=tool) / `skill_tools` | **工具候选台账**（**故意不按 sessionId 隔离**——跨会话累积的熔炉产出）：`{ updatedAt, candidates: { <tool>: { tool, plugin, skill, why, status, turns[] } } }` |
 | `${DSH_AGENTS_HOME:-~/.agents}/skills/<name>/SKILL.md` | `skill_commit`（scope=user） | 技能产物（YAML frontmatter + 正文），DSH 技能目录**原生可加载** |
 | `<cwd>/.agents/skills/<name>/SKILL.md` | `skill_commit`（scope=project） | 项目级技能产物 |
 | `<工作区>/.dsh/` 下其他文件 | 宿主/其他插件 | 只读参考 |
@@ -135,14 +153,14 @@ node -e "const fs=require('fs');const d='.dsh';const f=fs.readdirSync(d).filter(
 npm test        # = node --test "tests/*.test.mjs"（跑 lib/ 产物，需先 npm run build）
 ```
 
-**86 例离线测试全部通过**（`# pass 86 / # fail 0`）：
+**98 例离线测试全部通过**（`# pass 98 / # fail 0`）：
 
 | 文件 | 覆盖 |
 |------|------|
 | `tests/aggregate.test.mjs` | 轨迹聚合：逐 turn 计数（事件/工具/报错/估算 token/上下文字符）、候选轮判定（`isCandidateTurn` 对 `ctxSignalChars` 的边界）、压缩候选选择、`wasted` 过滤 |
-| `tests/policy.test.mjs` | 决策纯函数：`decideCompactHint`（阈值 + 段内节流、边界值、跳过分支）、通知阈值推进（步数/工具双轨复合触发）、通知状态迁移（`migrateNotifyState`，含旧形状兼容）、`validateSkillCommit`（早退顺序：先名字后正文）、工具引用提取与「幻觉工具」判定、`buildCommitNote` 文案 |
-| `tests/text.test.mjs` | 文本处理：frontmatter 拼装（description 换行折叠）、联动视图渲染、超长分段、空输入退化 |
-| `tests/trace-store.test.mjs` | 落盘层：索引/标记按 `sessionId` 隔离的路径拼装、写 JSON 自动建父目录、读 JSON 对「不存在/坏 JSON/是目录」一律 `undefined`；**尸体测试**——父路径是普通文件的不可写路径 → 断言 `false` 且不抛 |
+| `tests/policy.test.mjs` | 决策纯函数：`decideCompactHint`（阈值 + 段内节流、边界值、跳过分支）、通知阈值推进（步数/工具双轨复合触发）、通知状态迁移（`migrateNotifyState`，含旧形状兼容）、`validateSkillCommit`（早退顺序：名字 → kind → kind 专属 → 正文；**向后兼容硬约束**；kind fail-closed；tool/workflow 形态与具体性门槛）、`resolveSkillKind`、工具引用提取与「幻觉工具」判定、`buildCommitNote` 文案 |
+| `tests/text.test.mjs` | 文本处理：frontmatter 拼装（description 换行折叠）、联动视图渲染、超长分段、空输入退化；**具体性计数** `countNumberedSteps` / `countConcreteSnippets`（含未闭合围栏不计）、`buildToolCandidateNote` 与 kind 文案 |
+| `tests/trace-store.test.mjs` | 落盘层：索引/标记按 `sessionId` 隔离的路径拼装、**工具台账不隔离**的路径语义、写 JSON 自动建父目录、读 JSON 对「不存在/坏 JSON/是目录」一律 `undefined`；**尸体测试**——父路径是普通文件的不可写路径 → 断言 `false` 且不抛 |
 
 **无网络依赖、无真实外部服务依赖**：全部离线（纯函数 + 临时目录）。`memoryApi`（`dsh-agent-memory`）在测试中不需要——未挂载时技能索引回流被静默跳过，SKILL.md 仍是权威存储。
 
@@ -155,6 +173,8 @@ npm test        # = node --test "tests/*.test.mjs"（跑 lib/ 产物，需先 np
 - **投递必须延迟且成功后推进状态**：`turn/end` 事件由 `session.append` 同步发布，回调内直接 `agent.send` 会撞上 `session append cannot reenter`（实测每次都抛）。修法是 `setImmediate` 延迟到当前 append 事务完成后投递，并且**只有 send 成功才推进阈值状态**——否则会出现「状态说提醒过了，消息从没到过」。
 - **观测/持久化不反噬**：落盘层只做「路径拼装 + 读写」，任何失败吞错返回 bool；业务判据全在 `policy.ts` / `aggregate.ts`（纯函数，可离线回归）。
 - **废渣标记是防重复，不是评价**：`wasted=true` 只表示「已炼化」，让信号不再重复提示同一批轮次。
+- **产物按载体分流（v0.2.0）**：指导落技能目录（要被**读到**），工具落插件与台账（要被**执行到**）。判据挂在 `kind` 上、校验在提交时 fail-loud——「具体工作流」不许只有形容词，「固化工具」不许只写成一段文字。
+- **隔离维度按语义决定（v0.2.0）**：会话旁路产物（索引/标记）按 `sessionId` 隔离防互相覆盖；熔炉产出（工具台账）跨会话累积防意图蒸发。同一份代码里两个相反的隔离策略，是因为它们承载的语义相反——不是不一致。
 
 ## 相关文档
 

@@ -11,7 +11,7 @@ import assert from 'node:assert/strict'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { readJsonFile, skillIndexPath, skillMarksPath, writeJsonFile } from '../lib/trace-store.js'
+import { readJsonFile, skillIndexPath, skillMarksPath, skillToolsPath, writeJsonFile } from '../lib/trace-store.js'
 
 /** 每例独立临时目录（测试结束清理） */
 function tmpRoot(t) {
@@ -26,6 +26,14 @@ test('主路径：索引/标记文件按 sessionId 隔离（跨会话不互相�
   assert.equal(skillIndexPath('E:\\alice', 'session-abc'), join('E:\\alice', '.dsh', 'skill-forge-index-session-abc.json'))
   assert.equal(skillMarksPath('E:\\alice', 'session-abc'), join('E:\\alice', '.dsh', 'skill-forge-marks-session-abc.json'))
   assert.notEqual(skillIndexPath('.', 's1'), skillIndexPath('.', 's2'))
+})
+
+test('语义扩充：工具候选台账**不**按 sessionId 隔离（跨会话累积的产出，维度按语义决定）', () => {
+  assert.equal(skillToolsPath('E:\\alice'), join('E:\\alice', '.dsh', 'skill-forge-tools.json'))
+  // 与 sessionId 无关：同一 cwd 永远同一文件（这正是「不蒸发」的落点）
+  assert.equal(skillToolsPath('E:\\alice'), skillToolsPath('E:\\alice'))
+  // 与同为 cwd 维度的索引路径形态不同（索引带 sessionId 后缀）
+  assert.notEqual(skillToolsPath('.'), skillIndexPath('.', 's1'))
 })
 
 // ---------- 写：主路径 ----------

@@ -12,6 +12,9 @@ import {
   buildCommitNote,
   buildCompactHintText,
   buildNotifyText,
+  buildToolCandidateNote,
+  countConcreteSnippets,
+  countNumberedSteps,
   extractToolRefs,
   summarizeBlocks,
   truncate,
@@ -58,24 +61,32 @@ test('退化：空串/零上限不抛', () => {
 
 // ---------- extractToolRefs ----------
 
-test('主路径：反引号标识符与「工具：xxx」双模式提取', () => {
-  assert.deepEqual(extractToolRefs('用 `wq_simulate` 回测'), ['wq_simulate'])
+test('主路径：调用形态与「工具：xxx」双模式提取', () => {
+  assert.deepEqual(extractToolRefs('用 `wq_simulate(` 回测'), ['wq_simulate'])
+  assert.deepEqual(extractToolRefs('先 `bounty_deliver(claim_id, token)` 再写台账'), ['bounty_deliver'])
   assert.deepEqual(extractToolRefs('工具：skill_commit 写入'), ['skill_commit'])
-  assert.deepEqual(extractToolRefs('工具: wq_simulate'), ['wq_simulate'])
-  assert.deepEqual(extractToolRefs('先 `read` 再 工具：write 落盘'), ['read', 'write'])
+  assert.deepEqual(extractToolRefs('工具: `wq_simulate`'), ['wq_simulate'])
+  assert.deepEqual(extractToolRefs('先 工具：write 落盘'), ['write'])
+})
+
+test('回归·2026-09-16 假阳性根因：JSON 字段名/错误码/枚举/shell 命令都不再算工具引用', () => {
+  const body = '顶层 `summary`（≥80 字符）+ `observations` 数组；`receipt_ref=runx:receipt:<id>`；'
+    + '错误码 `bad_receipt_ref`、`payout_target_in_use`；状态 `pending` / `failed`；命令 `curl -sS`；'
+    + '字段 `rail`、`report_depth`、`github_not_found`。'
+  assert.deepEqual(extractToolRefs(body), [])
 })
 
 test('主路径：重复引用去重', () => {
-  assert.deepEqual(extractToolRefs('`wq_simulate` 与 `wq_simulate` 一样'), ['wq_simulate'])
+  assert.deepEqual(extractToolRefs('`wq_simulate(` 与 `wq_simulate(` 一样'), ['wq_simulate'])
 })
 
 test('边界保守：标识符短于 3 字符不匹配（正则下限 2,40）', () => {
-  assert.deepEqual(extractToolRefs('`ab`'), [])
+  assert.deepEqual(extractToolRefs('`ab(`'), [])
   assert.deepEqual(extractToolRefs('工具：ab'), [])
 })
 
 test('边界保守：大写开头不匹配（工具名规则为小写）', () => {
-  assert.deepEqual(extractToolRefs('`Read`'), [])
+  assert.deepEqual(extractToolRefs('`Read(`'), [])
 })
 
 test('退化：空文本不抛返回空表', () => {
@@ -128,4 +139,42 @@ test('主路径：skill_commit 文案（有未知工具时追加告警行）', (
 
 test('退化：skill_commit 文案轮数为 0 不抛', () => {
   assert.ok(buildCommitNote(0, []).includes('已炼化轨迹 0 轮标记为废渣'))
+})
+
+// ---------- 语义扩充：具体性计数（kind=workflow 的可证伪判据）----------
+// 判据要点：「具体」必须能被机械判定——有可执行的命令/调用 vs 只有形容词。
+
+test('countNumberedSteps：行首编号与小标题都算，散文算 0', () => {
+  assert.equal(countNumberedSteps('1. 先做 A\n2. 再做 B'), 2)
+  assert.equal(countNumberedSteps('1) 先做 A\n2) 再做 B'), 2)
+  assert.equal(countNumberedSteps('## 步骤 1\n### 步骤 2'), 2)
+  assert.equal(countNumberedSteps('先做 A，再做 B'), 0)
+  assert.equal(countNumberedSteps('第 1 步做 A'), 0) // 「第 N 步」不算：判据是行首编号/小标题
+  assert.equal(countNumberedSteps(''), 0)
+})
+
+test('countConcreteSnippets：围栏块 + 围栏外行内代码；未闭合围栏不计（宁可判不够具体）', () => {
+  assert.equal(countConcreteSnippets('```\ncmd a\n```'), 1)
+  assert.equal(countConcreteSnippets('跑 `npm run build` 即可'), 1)
+  assert.equal(countConcreteSnippets('```\nx\n```\n\n跑 `npm test`'), 2)
+  assert.equal(countConcreteSnippets('只有形容词，没有命令'), 0)
+  assert.equal(countConcreteSnippets(''), 0)
+  assert.equal(countConcreteSnippets('```\n未闭合的围栏'), 0)
+})
+
+test('kind=workflow 文案：头部标注类型，其余与 guidance 逐字相同（只换头）', () => {
+  const g = buildCommitNote(2, [])
+  const w = buildCommitNote(2, [], 'workflow')
+  assert.ok(g.startsWith('SKILL.md 已写入；'))
+  assert.ok(w.startsWith('SKILL.md（kind=workflow：具体高效工作流）已写入；'))
+  assert.equal(w.slice(w.indexOf('；')), g.slice(g.indexOf('；')))
+})
+
+test('kind=tool 文案：明说写台账不写 SKILL.md，并指向 plugin_forge', () => {
+  const note = buildToolCandidateNote({ tool: 'earn_scan', plugin: 'dsh-earn-radar', turnsRequested: 3, existed: false })
+  assert.ok(note.includes('工具候选已登记：earn_scan → dsh-earn-radar'))
+  assert.ok(note.includes('不写 SKILL.md'))
+  assert.ok(note.includes('plugin_forge'))
+  assert.ok(note.includes('已炼化轨迹 3 轮'))
+  assert.ok(buildToolCandidateNote({ tool: 'x', plugin: 'p', turnsRequested: 0, existed: true }).includes('工具候选已更新'))
 })

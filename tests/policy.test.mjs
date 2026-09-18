@@ -18,9 +18,17 @@ import {
   isCandidateTurn,
   isHighValueTurn,
   migrateNotifyState,
+  resolveSkillKind,
   validateSkillCommit,
   SKILL_BODY_NOTE,
+  SKILL_KIND_NOTE,
   SKILL_NAME_NOTE,
+  SKILL_TOOL_NOTE,
+  SKILL_WORKFLOW_NOTE,
+  TOOL_NAME_PATTERN,
+  TOOL_PLUGIN_PATTERN,
+  WORKFLOW_MIN_SNIPPETS,
+  WORKFLOW_MIN_STEPS,
 } from '../lib/policy.js'
 
 /** 源码真源常数（index.ts Config schema 默认值） */
@@ -229,4 +237,81 @@ test('校验早退顺序：名称不合规优先于正文为空（与提取前�
 
 test('校验脏数据不抛：空白名（空格）被拒而非崩溃', () => {
   assert.deepEqual(validateSkillCommit({ name: '   ', description: 'd', body: 'b' }), { ok: false, note: SKILL_NAME_NOTE })
+})
+
+// ---------- 语义扩充：产物类型 kind（2026-09-16 主人定调）----------
+// 两类硬约束：① 向后兼容——不传 kind / kind=guidance 的判定与扩前**逐字相同**；
+//             ② fail-closed——未知 kind 一律拒，绝不当成 guidance 放行（否则写出的产物类型是错的）
+
+test('resolveSkillKind：缺省/空串 → guidance；三态合法；未知 → undefined（非法）', () => {
+  assert.equal(resolveSkillKind(undefined), 'guidance')
+  assert.equal(resolveSkillKind(null), 'guidance')
+  assert.equal(resolveSkillKind(''), 'guidance')
+  assert.equal(resolveSkillKind('guidance'), 'guidance')
+  assert.equal(resolveSkillKind('workflow'), 'workflow')
+  assert.equal(resolveSkillKind('tool'), 'tool')
+  assert.equal(resolveSkillKind('Workflow'), undefined)
+  assert.equal(resolveSkillKind('skill'), undefined)
+})
+
+test('向后兼容（硬约束）：不传 kind 与显式 kind=guidance 判定完全一致', () => {
+  const base = { name: 'ok-name', description: 'd', body: 'b' }
+  assert.deepEqual(validateSkillCommit(base), validateSkillCommit({ ...base, kind: 'guidance' }))
+  assert.deepEqual(validateSkillCommit(base), { ok: true })
+  // 正文为空的 guidance 路径也须逐字不变
+  assert.deepEqual(validateSkillCommit({ name: 'ok-name', description: '', body: 'b', kind: 'guidance' }), { ok: false, note: SKILL_BODY_NOTE })
+})
+
+test('kind 非法 → 拒绝（fail-closed，不得当成 guidance 放行）', () => {
+  assert.deepEqual(
+    validateSkillCommit({ name: 'ok-name', description: 'd', body: 'b', kind: 'skill' }),
+    { ok: false, note: SKILL_KIND_NOTE },
+  )
+})
+
+test('校验早退顺序：名称不合规 > kind 非法 > kind 专属 > 正文为空', () => {
+  // 名称不合规优先于一切
+  assert.deepEqual(validateSkillCommit({ name: 'BAD', description: '', body: '', kind: 'bogus' }), { ok: false, note: SKILL_NAME_NOTE })
+  // kind 非法优先于正文空
+  assert.deepEqual(validateSkillCommit({ name: 'ok-name', description: '', body: '', kind: 'bogus' }), { ok: false, note: SKILL_KIND_NOTE })
+  // kind 专属优先于正文空（tool 缺名在后）
+  assert.deepEqual(validateSkillCommit({ name: 'ok-name', description: '', body: '', kind: 'tool' }), { ok: false, note: SKILL_TOOL_NOTE })
+  // workflow 不具体优先于正文空
+  assert.deepEqual(
+    validateSkillCommit({ name: 'ok-name', description: '', body: '', kind: 'workflow', numberedSteps: 0, concreteSnippets: 0 }),
+    { ok: false, note: SKILL_WORKFLOW_NOTE },
+  )
+})
+
+test('kind=tool：toolName / toolPlugin 缺一即拒，形态非法即拒', () => {
+  const ok = { name: 'ok-name', description: 'd', body: '理由', kind: 'tool', toolName: 'earn_scan', toolPlugin: 'dsh-earn-radar' }
+  assert.deepEqual(validateSkillCommit(ok), { ok: true })
+  assert.deepEqual(validateSkillCommit({ ...ok, toolName: '' }), { ok: false, note: SKILL_TOOL_NOTE })
+  assert.deepEqual(validateSkillCommit({ ...ok, toolPlugin: '' }), { ok: false, note: SKILL_TOOL_NOTE })
+  for (const toolName of ['Earn', '1scan', 'earn-scan', 'earn scan', '中文']) {
+    assert.deepEqual(validateSkillCommit({ ...ok, toolName }), { ok: false, note: SKILL_TOOL_NOTE }, `toolName=${toolName} 应被拒`)
+  }
+  for (const toolPlugin of ['Bad', '-x', 'a_b', 'a b']) {
+    assert.deepEqual(validateSkillCommit({ ...ok, toolPlugin }), { ok: false, note: SKILL_TOOL_NOTE }, `toolPlugin=${toolPlugin} 应被拒`)
+  }
+})
+
+test('形态正则真源：TOOL_NAME_PATTERN / TOOL_PLUGIN_PATTERN 各自只放行自己的形态', () => {
+  assert.ok(TOOL_NAME_PATTERN.test('skill_tools'))
+  assert.equal(TOOL_NAME_PATTERN.test('skill-tools'), false)
+  assert.ok(TOOL_PLUGIN_PATTERN.test('dsh-earn-radar'))
+  assert.equal(TOOL_PLUGIN_PATTERN.test('dsh_earn_radar'), false)
+})
+
+test('kind=workflow：具体性门槛（≥2 编号步骤 + ≥1 可执行片段）——不达即拒', () => {
+  const base = { name: 'ok-name', description: 'd', body: '正文', kind: 'workflow' }
+  assert.deepEqual(
+    validateSkillCommit({ ...base, numberedSteps: WORKFLOW_MIN_STEPS, concreteSnippets: WORKFLOW_MIN_SNIPPETS }),
+    { ok: true },
+  )
+  // 缺一不可
+  assert.deepEqual(validateSkillCommit({ ...base, numberedSteps: 1, concreteSnippets: 1 }), { ok: false, note: SKILL_WORKFLOW_NOTE })
+  assert.deepEqual(validateSkillCommit({ ...base, numberedSteps: 2, concreteSnippets: 0 }), { ok: false, note: SKILL_WORKFLOW_NOTE })
+  // 计数缺省（未传）= 0 ⇒ 拒（fail-closed：拿不到具体性证据就不许当「具体工作流」）
+  assert.deepEqual(validateSkillCommit(base), { ok: false, note: SKILL_WORKFLOW_NOTE })
 })

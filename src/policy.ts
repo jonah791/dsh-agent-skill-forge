@@ -177,13 +177,75 @@ export const SKILL_BODY_NOTE = 'description 与 body 不能为空'
 /** 技能名形态：小写 kebab-case（首字符字母或数字，后续字母/数字/连字符） */
 export const SKILL_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/
 
+// ── 产物类型（2026-09-16 主人定调「扩充语义包括插件工具、具体的高效工作流」）──────────
+
 /**
- * skill_commit 输入校验（早退顺序：先名字后正文，与提取前一致）。
- * 通过 → { ok: true }；不通过 → { ok: false, note }（note 直接回填工具返回值）。
+ * 熔炉产物类型。扩充前熔炉只有一种产物（指导性 SKILL.md）；现在按**载体**分三类：
+ * - `guidance` 条件化行为规则 → SKILL.md（原语义，逐字不变）
+ * - `workflow` 具体高效工作流（编号步骤 + 可执行片段）→ SKILL.md（frontmatter 带 kind）
+ * - `tool`     该固化的插件工具 → **工具候选台账**（不写 SKILL.md——工具的载体是插件）
  */
-export function validateSkillCommit(input: { name: string; description: string; body: string }): { ok: true } | { ok: false; note: string } {
+export type SkillKind = 'guidance' | 'workflow' | 'tool'
+
+export const SKILL_KINDS: readonly SkillKind[] = ['guidance', 'workflow', 'tool']
+
+export const SKILL_KIND_NOTE = 'kind 必须是 guidance / workflow / tool 之一'
+export const SKILL_TOOL_NOTE = 'kind=tool 必须给 toolName（小写字母开头，仅 [a-z0-9_]）与 toolPlugin（小写 kebab 的插件包名）——工具固化成插件，不是写成技能'
+export const SKILL_WORKFLOW_NOTE = 'workflow 必须是**具体**的：正文需 ≥2 条编号步骤（1. / 2) / ## 步骤 N）且 ≥1 处可执行片段（``` 代码块 或 `行内代码`）——只有形容词的工作流请用 kind=guidance'
+
+/** 工具名形态：小写字母开头，仅 [a-z0-9_] */
+export const TOOL_NAME_PATTERN = /^[a-z][a-z0-9_]*$/
+/** 插件包名形态：小写 kebab（首字符字母或数字） */
+export const TOOL_PLUGIN_PATTERN = /^[a-z0-9][a-z0-9-]*$/
+
+/** workflow 具体性门槛（判据真源：可证伪——不达即拒） */
+export const WORKFLOW_MIN_STEPS = 2
+export const WORKFLOW_MIN_SNIPPETS = 1
+
+export interface SkillCommitInput {
+  name: string
+  description: string
+  body: string
+  /** 产物类型（缺省/空串 = guidance —— 向后兼容：旧调用方零影响） */
+  kind?: string
+  /** kind=tool：拟固化的工具名 */
+  toolName?: string
+  /** kind=tool：拟归属的插件包名 */
+  toolPlugin?: string
+  /** kind=workflow：编号步骤数（由 text.countNumberedSteps 提供；显式传入以保持本模块零依赖） */
+  numberedSteps?: number
+  /** kind=workflow：具体片段数（由 text.countConcreteSnippets 提供） */
+  concreteSnippets?: number
+}
+
+/** 解析产物类型：缺省/空串 → `guidance`；未知值 → `undefined`（非法，交给 validate 拒） */
+export function resolveSkillKind(kind: unknown): SkillKind | undefined {
+  if (kind === undefined || kind === null || kind === '') return 'guidance'
+  return SKILL_KINDS.includes(kind as SkillKind) ? (kind as SkillKind) : undefined
+}
+
+/**
+ * skill_commit 输入校验。早退顺序：
+ * ① 名字（原第一关，逐字不变）② kind 合法性（fail-closed：未知 kind 一律拒）
+ * ③ kind 专属（tool → 工具名/插件名；workflow → 具体性）④ description/body 非空（原第二关）
+ *
+ * 向后兼容（硬约束）：不传 kind / kind='guidance' 时 ②③ 都是空操作 ⇒ 返回值与判定逐字同扩充前。
+ */
+export function validateSkillCommit(input: SkillCommitInput): { ok: true } | { ok: false; note: string } {
   const { name, description, body } = input
   if (name.length === 0 || !SKILL_NAME_PATTERN.test(name)) return { ok: false, note: SKILL_NAME_NOTE }
+  const kind = resolveSkillKind(input.kind)
+  if (kind === undefined) return { ok: false, note: SKILL_KIND_NOTE }
+  if (kind === 'tool') {
+    const tn = input.toolName ?? ''
+    const tp = input.toolPlugin ?? ''
+    if (!TOOL_NAME_PATTERN.test(tn) || !TOOL_PLUGIN_PATTERN.test(tp)) return { ok: false, note: SKILL_TOOL_NOTE }
+  }
+  if (kind === 'workflow') {
+    const steps = input.numberedSteps ?? 0
+    const snips = input.concreteSnippets ?? 0
+    if (steps < WORKFLOW_MIN_STEPS || snips < WORKFLOW_MIN_SNIPPETS) return { ok: false, note: SKILL_WORKFLOW_NOTE }
+  }
   if (description.length === 0 || body.length === 0) return { ok: false, note: SKILL_BODY_NOTE }
   return { ok: true }
 }
