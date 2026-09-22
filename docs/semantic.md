@@ -126,7 +126,7 @@ session/event  ──┬─ user/message   → 记 contextChars（本轮输入�
 | A4 | 炼化通知按阈值 + 高价值轮触发 | 历史通知消息 + `notifyAfterSteps/Tools` 配置 | 已实测 |
 | A5 | reenter 不冲突（`setImmediate` 投递） | 历史修复记录 + 无 `session append cannot reenter` 报错 | 已实测 |
 | A6 | 段内累计不被压缩前历史顶满 | 代码：`segmentStart` + 段重置 | 已实测（代码） |
-| A7 | 有单测覆盖 | `node --test tests/*.test.mjs` → `# pass 98 / # fail 0` | 已实测 |
+| A7 | 有单测覆盖 | `node --test tests/*.test.mjs` → `# pass 99 / # fail 0`（aggregate 25 + policy 38 + text 25 + trace-store 11） | 已实测（**2026-09-22 复核复跑：99/99 绿**；旧记的 98 是 09-16 15:20 的快照，此后 `tests/text.test.mjs` 于同日 16:59 增补 1 例而未回写本文） |
 | A8 | 未知 `kind` 被拒，**不得**当 guidance 放行 | 单测「kind 非法 → 拒绝（fail-closed）」 | 已实测 |
 | A9 | 向后兼容：`guidance`（或缺省）的判定与产物**逐字/逐字节**不变 | 单测「不传 kind 与 kind=guidance 判定完全一致」+ 代码 `kindLine` 仅非 guidance 时非空 | 已实测 |
 | A10 | `workflow` 具体性门槛可证伪（步骤/片段不达即拒） | 单测「kind=workflow：具体性门槛」+ `countNumberedSteps`/`countConcreteSnippets` 单测 | 已实测 |
@@ -139,6 +139,7 @@ session/event  ──┬─ user/message   → 记 contextChars（本轮输入�
 - 主实现：`src/index.ts`（cordis 接线：索引、两提醒通道、五工具、配置）
 - 纯函数层：`src/policy.ts`（阈值/节流/状态迁移/**产物类型与结构判据**）、`src/text.ts`（文本摘要/工具引用/**具体性计数**/文案）、`src/aggregate.ts`（轮次聚合/视图构建）、`src/trace-store.ts`（落盘薄壳）
 - 同语义副本：无
+- **生态契约面（不属本条目的可运行语义）**：`src/fabric.ts` + `dsh-plugin.json`（2026-09-20 补 DSH Community Fabric 契约面）——Fabric 目前**只有文档**（无 SDK / 无正式 schema / 无 runtime），骨架自带声明「**现在不可运行**」；本插件的实际功能仍在 DSH/Cordis 面（`src/index.ts` + `cordis.patch.yml`）。⇒ 语义文档不为其背书、**不得**据此声称通过 Fabric conformance。
 - 未实现/未验证部分**显式标注**：① 压缩提醒的关闭只在本部署 profile 生效（插件默认仍是 `true`）② 轨迹索引的 `wasted` 标记只由 `skill_commit(turns=…)` 驱动，通知路径已按 `isCandidateTurn` 过滤但**通知投递本身**仍可能提及该轮所属批次 ③ `kind=tool` 只登记候选，**不生成**插件骨架（U4）
 
 ## 9 · 实践修订记录
@@ -155,11 +156,19 @@ session/event  ──┬─ user/message   → 记 contextChars（本轮输入�
   - 落点：① `kind` 三态（`guidance`/`workflow`/`tool`）② `workflow` 的**具体性**成为可证伪的结构判据（步骤数 + 片段数）③ `tool` 走**工具候选台账**（跨会话累积，载体是插件不是技能目录）④ 新增 `skill_tools` 工具
   - 硬约束：**向后兼容**——不传 `kind` / `guidance` 的判定与产出文件逐字节不变（I9）
   - 教训（沿用主人同日的另一条指令）：**产物该落到哪个载体，由产物是什么决定**——指导落技能目录（要被读到），工具落插件（要被执行到）。把工具塞进技能目录，等于让它只能被读到、不能被调用
+- **2026-09-22 复核记录（语义 drift D3 复核：判定为「非本条语义」的 impl 变动）**
+  - **D3 触发因**：本条目 impl 落点 `src/index.ts` 的 mtime（2026-09-19 21:52）晚于本文（2026-09-16 15:20）。逐项取证后**判定与本文语义无关**：
+    ① **未提交的工作区改动**（`git diff`：`turnsOf` 的返回类型收窄——去掉 `surface`/`events` 两个字段）——这是 **DSH 0.1.6 适配**（旧 Session 形状字段在新版不再存在，且该文件 535 行起已改经 seq + eventAt 读日志，字段无人使用）；**纯类型层收窄，零行为/零契约变化**。
+    ② `8f4e697`（2026-09-20 chore(fabric)）只新增 `src/fabric.ts` + `dsh-plugin.json`（Fabric 前瞻契约面，自述「现在不可运行」），未触及索引/提醒/五工具的任何语义。
+    ⇒ 二者都**不属于本条语义**（同一源文件承载多种关注点，impl 清单是**文件粒度**才被一起算进来）——**故不为消警而改内容**。
+  - 复核中**顺带发现并修正了一处真实过时**（与 D3 无关，属独立取证）：A7 与 U2 记的「98 例」是 2026-09-16 15:20 的快照，此后同日 16:59 `tests/text.test.mjs` 增补 1 例——2026-09-22 复跑 `node --test tests/*.test.mjs` 实为 **99/99 绿**（25+38+25+11），两处计数已回写。
+  - 语义**被补充**：§8 新增「生态契约面」一条——把 `src/fabric.ts` / `dsh-plugin.json` 显式标注为**不属本条目可运行语义**（Fabric 只有文档、骨架不可运行、不得据此声称 conformance），避免后续复核再次把 fabric 提交误算进本条 drift。
+  - 教训：**D3 是 mtime 判据，不是语义判据**——它只说明「impl 文件被碰过」，碰的是类型层、格式层还是另一条语义，必须逐提交读 diff 才能判。本条即典型假报：**同一 `src/index.ts` 里塞着 DSH 兼容性适配与业务语义两件事**。
 
 ## 10 · 未决问题
 
 - **U1** 压缩提醒关闭后，「压缩前炼化的收益最大化」这一动机由谁承接？（倾向：交给 §5.7 的日常炼化节奏，不再与压缩绑拍）
-- **U2** ~~是否给本插件补纯函数单测~~ → **已解决**（2026-09-14 可维护性补课抽出 policy/aggregate/text/trace-store，2026-09-16 扩至 **98 例**）
+- **U2** ~~是否给本插件补纯函数单测~~ → **已解决**（2026-09-14 可维护性补课抽出 policy/aggregate/text/trace-store，2026-09-16 扩至 **99 例**；2026-09-22 复核复跑 99/99 绿）
 - **U3** `wasted`（废渣）标记与通知路径的联动（当前 `skill_commit(turns)` 标记后，通知仍可能提示该轮所属批次）
 - **U4**（2026-09-16 新增）`kind=tool` 的候选能否直接驱动 `plugin_forge` 生成骨架（当前只登记，生成仍靠手工/显式调用 `plugin_forge`）——若要打通，须先定义「从候选到 spec」的映射（工具名/参数/实现要点从哪来）
 - **U5**（2026-09-16 新增）`workflow` 的具体性判据是否需要更强的形式（当前是计数门槛：≥2 步骤 + ≥1 片段）——计数可被「凑数」满足；是否需要断言「步骤与片段的一一对应」
