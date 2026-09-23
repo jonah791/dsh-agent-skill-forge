@@ -62,6 +62,12 @@ import {
 } from './text.js'
 import { readJsonFile, skillIndexPath, skillMarksPath, skillToolsPath, writeJsonFile } from './trace-store.js'
 
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'dsh-agent-skill-forge': { kind: 'dsh-agent-skill-forge' }
+  }
+}
+
 export const name = 'agent-skill-forge'
 export const inject = ['tools', 'agents', 'memoryApi'] as const
 
@@ -314,7 +320,7 @@ export function apply(ctx: Context, config: Config): void {
     // 计算当前候选数（供提示）
     const candidates = countCandidateTurns(byTurn.values(), config.ctxSignalChars)
     const text = buildCompactHintText({ total, candidates })
-    const message = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'plugin', plugin: 'dsh-agent-skill-forge' } })
+    const message = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'dsh-agent-skill-forge' } })
     // reenter 修复：延迟到当前 session.append 事务完成后投递
     setImmediate(() => {
       try {
@@ -359,7 +365,7 @@ export function apply(ctx: Context, config: Config): void {
       totalTools: decision.totalTools,
       errorTurns: decision.errorTurns,
     })
-    const message = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'plugin', plugin: 'dsh-agent-skill-forge' } })
+    const message = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'dsh-agent-skill-forge' } })
     // reenter 修复（同 maybeCompactHint）：turn/end 回调内同步 agent.send 会触发 session.append reenter，
     // 延迟到当前 append 事务完成后投递；send 成功才推进状态
     setImmediate(() => {
@@ -375,8 +381,11 @@ export function apply(ctx: Context, config: Config): void {
     })
   }
 
+  // DSH 0.1.6 适配：旧返回类型里手写的 `surface` / `events` 字段是 alpha.4 之前
+  // Session 的遗留形状（本文件 535 行起已改经 seq + eventAt 读日志），字段已无人使用，
+  // 且 0.1.6 的 Session 不再具备它们 → 收窄为实际所需的最小结构。
   function turnsOf(exec: ToolRunContext): {
-    session: { id: string; surface: { nodes: readonly number[] }; events: Record<number, unknown>; header?: { cwd?: string } } | undefined
+    session: { id: string; header?: { cwd?: string } } | undefined
     byTurn: Map<number, TurnIndex>
   } {
     const session = exec.agent?.session

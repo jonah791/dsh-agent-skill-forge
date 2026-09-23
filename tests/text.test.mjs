@@ -22,11 +22,11 @@ import {
 
 // ---------- summarizeBlocks ----------
 
-test('主路径：text 块拼接，tool-result 记块数，其余类型记号化', () => {
+test('主路径：text 块拼接，其余类型记号化（v4：块已上提，无 tool-result 块）', () => {
   assert.equal(summarizeBlocks({ content: [{ type: 'text', text: 'hello' }] }), 'hello')
   assert.equal(
-    summarizeBlocks({ content: [{ type: 'text', text: 'a' }, { type: 'tool-result', content: [1, 2, 3] }, { type: 'image' }] }),
-    'a\n[tool-result 3 blocks]\n[image]',
+    summarizeBlocks({ content: [{ type: 'text', text: 'a' }, { type: 'image' }, { type: 'tool-call' }] }),
+    'a\n[image]\n[tool-call]',
   )
 })
 
@@ -38,9 +38,9 @@ test('退化：空 content 不抛返回空串', () => {
   assert.equal(summarizeBlocks({ content: [] }), '')
 })
 
-test('脏数据不抛：text 块缺 text → 空段；tool-result 缺 content → 0 blocks', () => {
+test('脏数据不抛：text 块缺 text → 空段；其余类型一律记号化', () => {
   assert.equal(summarizeBlocks({ content: [{ type: 'text' }] }), '')
-  assert.equal(summarizeBlocks({ content: [{ type: 'tool-result' }] }), '[tool-result 0 blocks]')
+  assert.equal(summarizeBlocks({ content: [{ type: 'image' }] }), '[image]')
 })
 
 // ---------- truncate ----------

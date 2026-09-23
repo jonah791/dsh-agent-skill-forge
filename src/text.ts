@@ -8,12 +8,17 @@
 import type { Message } from '@deepseek-ai/dsh-llm'
 import type { SkillKind } from './policy.js'
 
-/** 消息内容摘要（text 块拼接截断） */
+/**
+ * 消息内容摘要（text 块拼接截断）。
+ *
+ * 2026-09-22 v4 契约适配：tool/result 的块已**上提到 message.content 顶层**，
+ * `tool-result` 从 ContentBlock 联合移除 ⇒ 旧分支既无类型重叠（TS2367）也永不命中。
+ * 工具输出的内容块现在直接参与循环，信息不丢（粒度反而更细）。
+ */
 export function summarizeBlocks(message: Message): string {
   const parts: string[] = []
   for (const block of message.content) {
     if (block.type === 'text') parts.push(block.text)
-    else if (block.type === 'tool-result') parts.push('[tool-result ' + String((block as { content?: unknown[] }).content?.length ?? 0) + ' blocks]')
     else parts.push('[' + block.type + ']')
   }
   return parts.join('\n')
