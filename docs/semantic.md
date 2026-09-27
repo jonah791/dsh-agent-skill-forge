@@ -165,6 +165,8 @@ session/event  ──┬─ user/message   → 记 contextChars（本轮输入�
   - 语义**被补充**：§8 新增「生态契约面」一条——把 `src/fabric.ts` / `dsh-plugin.json` 显式标注为**不属本条目可运行语义**（Fabric 只有文档、骨架不可运行、不得据此声称 conformance），避免后续复核再次把 fabric 提交误算进本条 drift。
   - 教训：**D3 是 mtime 判据，不是语义判据**——它只说明「impl 文件被碰过」，碰的是类型层、格式层还是另一条语义，必须逐提交读 diff 才能判。本条即典型假报：**同一 `src/index.ts` 里塞着 DSH 兼容性适配与业务语义两件事**。
 
+- **2026-09-28 D3 复核（0.1.7 平台适配波次 · 判为假报）**：触发提交 `4cb8b40`「fix(0.1.7): MessageSourceMap.plugin 已移除 ⇒ 生产者改自声明 source kind」。逐行对读 `git show 4cb8b40`（+24/−10）后确认改动只有三类：① 新增 `declare module '@deepseek-ai/dsh-llm'` 的 `MessageSourceMap` 声明；② 两处 `source: { kind: 'plugin', plugin: 'X' }` → `{ kind: 'X' }`；③ 收窄 Session 返回类型（去掉 alpha.4 以来无人使用的 `surface`/`events` 字段）并删掉一个永不命中的 `tool-result` 分支。**索引 / 提醒 / 五工具的契约与验收表均未被触及** ⇒ 不为消警而改内容。复核方式可复现：`git -C self-plugins/dsh-agent-skill-forge show 4cb8b40`。
+
 ## 10 · 未决问题
 
 - **U1** 压缩提醒关闭后，「压缩前炼化的收益最大化」这一动机由谁承接？（倾向：交给 §5.7 的日常炼化节奏，不再与压缩绑拍）
