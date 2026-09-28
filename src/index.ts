@@ -61,7 +61,7 @@ import {
   summarizeBlocks,
 } from './text.js'
 import { readJsonFile, skillIndexPath, skillMarksPath, skillToolsPath, writeJsonFile } from './trace-store.js'
-import { buildDriftNote, probeMirrorDrift } from './mirror-drift.js'
+import { buildDriftNote, probeMirrorDrift, warmUpMirrorDrift } from './mirror-drift.js'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -137,6 +137,11 @@ interface ToolCandidate {
 
 export function apply(ctx: Context, config: Config): void {
   console.log('[dsh-agent-skill-forge] apply', new Date().toISOString(), '(HMR probe)')
+
+  // 预热镜像漂移闸门（2026-09-28）：把 PowerShell 冷启动（实测 ~16.7s）从 skill_commit
+  // 路径上移走——线上第一次真实调用正是被它顶掉 15s 超时、报成「闸门不可用」。
+  // 异步、静默、不阻塞 apply。
+  warmUpMirrorDrift(config.mirrorCheckScript)
 
   const indexBySession = new Map<string, Map<number, TurnIndex>>()
   // 当前上下文压力：sessionId → 最近一次请求的完整输入 token（usage.inputTokens）。

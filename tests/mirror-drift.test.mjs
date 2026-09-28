@@ -12,7 +12,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildDriftNote, parseDriftCheck, probeMirrorDrift } from '../lib/mirror-drift.js'
+import { buildDriftNote, parseDriftCheck, probeMirrorDrift, warmUpMirrorDrift } from '../lib/mirror-drift.js'
 
 /** 夹具：无漂移（2026-09-28 实测，退出码 0） */
 const CLEAN_STDOUT = `模式 检查 · 镜像 E:\\alice\\alice-self-assets\\skills
@@ -122,4 +122,19 @@ test('未配置（空串）⇒ off，且不启动任何子进程', () => {
 test('未配置（纯空白）⇒ off（空白等同未配置，不当成路径）', () => {
   assert.deepEqual(probeMirrorDrift('   '), { kind: 'off' })
   assert.deepEqual(probeMirrorDrift('\t\n'), { kind: 'off' })
+})
+
+// ---------- warmUpMirrorDrift：预热是异步的，绝不能抛 ----------
+// 背景（2026-09-28 实测）：闸门冷启动 ≈ 16.7s（PowerShell 首启 + 缓存冷），热态 1.25s。
+// 预热把它从 skill_commit 路径上移走；但它跑在 `apply()` 里，**抛错就是宿主死因**（§5.24）。
+
+test('预热：未配置 ⇒ 直接返回，不抛、不启动子进程', () => {
+  assert.doesNotThrow(() => warmUpMirrorDrift(''))
+  assert.doesNotThrow(() => warmUpMirrorDrift('   '))
+})
+
+test('预热：路径不存在也**不得抛**（真 spawn 路径的 error 监听验收）', () => {
+  // 在非 Windows 平台会在平台检查处直接返回；在 Windows 会真 spawn 一个不存在的脚本——
+  // 若未注册 child.on('error')，未监听的 error 事件会抛出并杀死宿主。这条测的就是那个监听。
+  assert.doesNotThrow(() => warmUpMirrorDrift('E:\\definitely\\not\\a\\gate.ps1'))
 })

@@ -18,7 +18,7 @@
  * 关键在于 `unavailable` **不得**与 `clean` 合并——「读不到」伪装成「无漂移」正是 2026-09-28
  * 修掉的假绿形状（旧闸门只对账一源，同一状态报「真源独有技能 0」而事实是 4）。
  */
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 
 /** 漂移读数 */
 export interface DriftReading {
@@ -84,7 +84,12 @@ export function probeMirrorDrift(
   if (process.platform !== 'win32') {
     return { kind: 'unavailable', reason: '闸门是 PowerShell 脚本，当前平台 ' + process.platform }
   }
-  const timeout = opts.timeoutMs ?? 15000
+  // 冷启动实测（2026-09-28 · Windows node · 同一脚本连跑三次）：**第一次 spawn ≈ 16.7s**
+  // （PowerShell 首启 + 磁盘缓存冷），之后 1.25s（16714 / 1262 / 1248 ms）。
+  // ⇒ 超时必须覆盖冷启动，否则**每次 web 重启后的首次提交必报「不可用」**——线上第一次
+  // 真实调用正是这样超时的（旧默认 15s，差一点）。另配 warmUpMirrorDrift() 在插件启动后
+  // 预热，把冷启动从提交路径上移走。
+  const timeout = opts.timeoutMs ?? 60000
   let res: ReturnType<typeof spawnSync>
   try {
     res = spawnSync(
@@ -110,4 +115,31 @@ export function probeMirrorDrift(
   }
   if (reading.count === 0) return { kind: 'clean' }
   return { kind: 'drift', reading }
+}
+
+/**
+ * 预热：插件启动后**异步**跑一次闸门，把「PowerShell 首启 + 磁盘缓存冷」的 ~16.7s 从
+ * `skill_commit` 路径上移走（2026-09-28 实测：冷 16714ms vs 热 1262ms）。
+ *
+ * 为什么不用 `probeMirrorDrift`：它是 `spawnSync`——**同步阻塞事件循环**，在 `apply()`
+ * 里调用会把宿主卡住十几秒。这里用异步 `spawn` + `stdio: 'ignore'`，只求把缓存焐热，
+ * 不要它的输出；**判据仍是同一个脚本**（单真源不变，只是换了调用姿势）。
+ *
+ * 失败**静默**：预热失败不是故障，真正的判据在提交时那次 `probeMirrorDrift`。
+ * ⚠ 必须注册 `error` 监听：未监听的子进程 `error` 事件会抛出并杀死宿主（AGENTS.md §5.24）。
+ */
+export function warmUpMirrorDrift(scriptPath: string, opts: { timeoutMs?: number } = {}): void {
+  if (scriptPath.trim() === '') return
+  if (process.platform !== 'win32') return
+  try {
+    const child = spawn(
+      'powershell.exe',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath, '-Check', '-Quiet'],
+      { windowsHide: true, stdio: 'ignore' },
+    )
+    const timer = setTimeout(() => { try { child.kill() } catch { /* 已退出 */ } }, opts.timeoutMs ?? 60000)
+    const done = (): void => { clearTimeout(timer) }
+    child.on('exit', done)
+    child.on('error', done)
+  } catch { /* 预热失败静默——真判据在提交时那次探测 */ }
 }
