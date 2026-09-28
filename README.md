@@ -11,7 +11,7 @@
 # dsh-agent-skill-forge
 
 <p align="center">
-  <a href="https://github.com/jonah791/dsh-agent-skill-forge"><img src="https://img.shields.io/badge/version-0.2.0-blue" alt="version"></a>
+  <a href="https://github.com/jonah791/dsh-agent-skill-forge"><img src="https://img.shields.io/badge/version-0.3.0-blue" alt="version"></a>
   <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
   <img src="https://img.shields.io/badge/tests-98%20passed-brightgreen" alt="tests">
@@ -44,7 +44,7 @@
 | `skill_signals` | 技能熔炉信号（只读）：本会话轨迹轮次索引——每轮的事件数/工具调用数/报错数/估算 token。选候选轮次后用 `skill_extract` 提取轨迹分析。决策（蒸馏什么/何时蒸馏）归爱丽丝。`limit` 取最近 N 轮（缺省 20） |
 | `skill_marks` | 压缩轨迹标记（只读）：最近一次压缩触发时标记的炼化候选 turn（含工具调用/报错/上下文规模特征）——压缩前上下文最全时刻的高价值轨迹，压缩后按此炼化收益最大化。只读信号，炼化决策归爱丽丝 |
 | `skill_extract` | 提取轨迹（只读）：按 turn 范围从会话事件流提取事件序列文本（用户消息/模型动作/工具调用/结果与错误），供爱丽丝蒸馏分析。零 LLM 调用（纯数据提取）。`linkContext=true`（缺省）时输出联动视图，供蒸馏「上下文特征 → 应对策略」条件化技能。`startTurn` 必需；`endTurn` 缺省 = `startTurn`；`maxChars` 缺省 20000（超长分段返回） |
-| `skill_commit` | 把轨迹蒸馏产物落盘（**可写**）。产物类型由 `kind` 决定：`guidance` → SKILL.md；`workflow` → SKILL.md（frontmatter 带 kind）；`tool` → 工具候选台账。guidance/workflow 默认写 `~/.agents/skills/<name>/SKILL.md`，`scope=project` 写 `<cwd>/.agents/skills/`。纪律：技能只提供指导（决策/流程/规避），不提供工具——正文引用的工具限于系统工具面（提交时自动校验，幻觉工具会警告）。`turns` 声明的轮次提交后标记为**废渣** |
+| `skill_commit` | 把轨迹蒸馏产物落盘（**可写**）。产物类型由 `kind` 决定：`guidance` → SKILL.md；`workflow` → SKILL.md（frontmatter 带 kind）；`tool` → 工具候选台账。guidance/workflow 默认写 `~/.agents/skills/<name>/SKILL.md`，`scope=project` 写 `<cwd>/.agents/skills/`。纪律：技能只提供指导（决策/流程/规避），不提供工具——正文引用的工具限于系统工具面（提交时自动校验，幻觉工具会警告）。`turns` 声明的轮次提交后标记为**废渣**。落盘成功后若配了 `mirrorCheckScript`，会跑一次**只读**闸门并把镜像仓漂移读数追加进回执（只报数，不同步） |
 | `skill_tools` | 工具候选台账（读 + 流转）：`skill_commit(kind=tool)` 的产物。不传 `tool` 列全部候选（含状态计数）；只传 `tool` 看详情；传 `tool` + `status`/`plugin`/`note` 则流转该候选（`candidate` → `forged`/`abandoned`）。台账**跨会话累积**，不随会话结束蒸发 |
 
 背景行为（无工具面，自动发生）：
@@ -100,6 +100,7 @@ cd self-plugins/dsh-agent-skill-forge && npm install && npm run build && npm tes
 | `notifyEnabled` | `true` | 炼化通知开关（信号送达，炼化决策归 agent） |
 | `notifyAfterSteps` | `200` | 炼化通知·步数轨阈值（累计 step；步是真实工作单元，一轮可含多步） |
 | `notifyAfterTools` | `200` | 炼化通知·工具调用轨阈值（长跑会话「工具密集但步数慢」时更敏感） |
+| `mirrorCheckScript` | `''` | **镜像仓漂移闸门**（2026-09-28 新增）：`skill_commit` 写完 `SKILL.md` 后跑一次**只读**检查（`sync-skills.ps1 -Check`），把漂移读数追加进回执。空串 = 关闭（**缺省关闭**：脚本路径由 profile patch 显式配置）。语义：**只报数，不同步**；退出码 2/3 报「不可用」而非「无漂移」 |
 
 ## 落盘与自证（出问题时先看这里）
 
@@ -153,7 +154,7 @@ node -e "const fs=require('fs');const d='.dsh';const f=fs.readdirSync(d).filter(
 npm test        # = node --test "tests/*.test.mjs"（跑 lib/ 产物，需先 npm run build）
 ```
 
-**98 例离线测试全部通过**（`# pass 98 / # fail 0`）：
+**113 例离线测试全部通过**（`# pass 113 / # fail 0`，2026-09-28 复跑；旧记的 98 是更早快照）：
 
 | 文件 | 覆盖 |
 |------|------|
@@ -161,6 +162,7 @@ npm test        # = node --test "tests/*.test.mjs"（跑 lib/ 产物，需先 np
 | `tests/policy.test.mjs` | 决策纯函数：`decideCompactHint`（阈值 + 段内节流、边界值、跳过分支）、通知阈值推进（步数/工具双轨复合触发）、通知状态迁移（`migrateNotifyState`，含旧形状兼容）、`validateSkillCommit`（早退顺序：名字 → kind → kind 专属 → 正文；**向后兼容硬约束**；kind fail-closed；tool/workflow 形态与具体性门槛）、`resolveSkillKind`、工具引用提取与「幻觉工具」判定、`buildCommitNote` 文案 |
 | `tests/text.test.mjs` | 文本处理：frontmatter 拼装（description 换行折叠）、联动视图渲染、超长分段、空输入退化；**具体性计数** `countNumberedSteps` / `countConcreteSnippets`（含未闭合围栏不计）、`buildToolCandidateNote` 与 kind 文案 |
 | `tests/trace-store.test.mjs` | 落盘层：索引/标记按 `sessionId` 隔离的路径拼装、**工具台账不隔离**的路径语义、写 JSON 自动建父目录、读 JSON 对「不存在/坏 JSON/是目录」一律 `undefined`；**尸体测试**——父路径是普通文件的不可写路径 → 断言 `false` 且不抛 |
+| `tests/mirror-drift.test.mjs` | 镜像漂移闸门（14 例）：`parseDriftCheck` 以**退出码**为判据（0/1 是读数；2=路径缺失 / 3=真源冲突 ⇒ `null` = **仪器故障**，不得当「无漂移」）、项数解析不到降级为「项数未知」而非「0 项」；`buildDriftNote` 四态文案（`off`/`clean` 空串 · `drift` 带项数与指路 · `unavailable` 报故障）；`probeMirrorDrift` 未配置路径**不触发**子进程 |
 
 **无网络依赖、无真实外部服务依赖**：全部离线（纯函数 + 临时目录）。`memoryApi`（`dsh-agent-memory`）在测试中不需要——未挂载时技能索引回流被静默跳过，SKILL.md 仍是权威存储。
 

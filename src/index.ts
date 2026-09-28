@@ -61,6 +61,7 @@ import {
   summarizeBlocks,
 } from './text.js'
 import { readJsonFile, skillIndexPath, skillMarksPath, skillToolsPath, writeJsonFile } from './trace-store.js'
+import { buildDriftNote, probeMirrorDrift } from './mirror-drift.js'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -91,6 +92,14 @@ export interface Config {
    * 注意区分：**压缩提醒（本项）≠ 上下文提醒**（`dsh-agent-context` 的越阈值提示），后者保留。
    */
   compactHintEnabled: boolean
+  /**
+   * 镜像仓漂移闸门：`skill_commit` 写完 SKILL.md 后跑一次**只读**检查
+   * （`sync-skills.ps1 -Check`），把漂移读数带进返回 note。
+   *
+   * 空字符串 = 关闭（**缺省关闭**：闸门脚本路径是本机事实，不由插件猜——显式优于隐式）。
+   * 语义：**只报数，不同步**。同步 = 写镜像仓，属爱丽丝的决策（AGENTS.md §2.1）。
+   */
+  mirrorCheckScript: string
 }
 
 export const Config = z.object({
@@ -101,6 +110,7 @@ export const Config = z.object({
   notifyEnabled: z.boolean().default(true),
   notifyAfterSteps: z.number().step(1).min(1).default(200),
   notifyAfterTools: z.number().step(1).min(1).default(200),
+  mirrorCheckScript: z.string().default(''),
 })
 
 /**
@@ -690,7 +700,12 @@ export function apply(ctx: Context, config: Config): void {
           void api.remember({ text, kind: 'knowledge', tags: ['技能', name], key: 'skill-' + name }).catch(() => { /* 回流失败静默 */ })
         }
       } catch { /* 回流失败不阻塞技能提交 */ }
-      return { path, name, note }
+      // 落盘后的只读闸门（2026-09-28）：真源已更新 ⇒ 镜像仓此刻**必然**落后，
+      // 差别只在「有人同步过没有」。把读数带进 note = 触发点长在我必然经过的地方
+      // （纪律写在文档里挡不住第二次复发，见技能 skill-maintenance §7）。
+      // 只报数不同步；探测失败返回 unavailable 而非静默（静默就是又一次假绿）。
+      const driftNote = buildDriftNote(probeMirrorDrift(config.mirrorCheckScript))
+      return { path, name, note: note + driftNote }
     },
   })
 

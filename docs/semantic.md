@@ -84,6 +84,13 @@ session/event  ──┬─ user/message   → 记 contextChars（本轮输入�
 - `compactHintTokens`(300000)：压缩提醒的压力阈值
 - `compactHintEnabled`(true)：**压缩提醒开关**（本部署 profile 置 `false`）
 - `notifyEnabled`(true) / `notifyAfterSteps`(200) / `notifyAfterTools`(200)：炼化通知阈值
+- `mirrorCheckScript`('')：**镜像仓漂移闸门**（2026-09-28 新增）——`skill_commit` 写完 SKILL.md 后跑一次**只读**检查（`sync-skills.ps1 -Check`），把漂移读数带进返回 `note`。空串 = 关闭（**缺省关闭**：脚本路径是本机事实，不由插件猜——显式优于隐式）。语义：**只报数，不同步**（同步 = 写镜像仓，属爱丽丝的决策，AGENTS.md §2.1）
+
+> ⚠ **本节的唯一真源是 `cordis.patch.yml` 的 `config:` 块**（本部署 web profile 第 89–101 行）。
+> 取证教训（2026-09-28）：`plugin_inspect` 对本插件返回 `config: {}`，而 patch 里实有 7 项——
+> **工具的读数是「它读到的域」，不等于真源**。据此直接 `plugin_configure`（整体替换）会静默抹掉
+> `compactHintEnabled: false`，把压缩提醒回归成 `true`（违背主人 2026-09-14 定调）。
+> ⇒ 改本插件配置必须**先读 patch 原文**，改就该手工 edit 以保留注释。
 
 ### 4.2 投递文本（可被日志/事件流断言）
 - 炼化通知：`[skill-forge] …`（含候选数、工具链/报错特征，指向 `skill_signals` / `skill_extract`）
@@ -101,6 +108,7 @@ session/event  ──┬─ user/message   → 记 contextChars（本轮输入�
 | 落盘（会话旁路） | `src/trace-store.ts` `skillIndexPath` / `skillMarksPath` | 按 `sessionId` 隔离 |
 | 落盘（熔炉产出） | `src/trace-store.ts` `skillToolsPath` | **不**按 `sessionId` 隔离（I10） |
 | 记忆 | `ctx.memoryApi.remember(...)`（可选） | `skill_commit`（guidance/workflow）成功后回流主记忆库（不可用则静默） |
+| 子进程（只读） | `src/mirror-drift.ts` `probeMirrorDrift(config.mirrorCheckScript)` | `skill_commit`（guidance/workflow）**落盘成功后**跑 `sync-skills.ps1 -Check`（带 timeout），把读数交 `buildDriftNote` 追加进 note。`kind=tool` **不跑**（台账不写技能目录 ⇒ 不产生镜像漂移）；`mirrorCheckScript` 为空则整个分支短路（`off`） |
 
 ## 5 · 边界与信任
 
@@ -126,13 +134,15 @@ session/event  ──┬─ user/message   → 记 contextChars（本轮输入�
 | A4 | 炼化通知按阈值 + 高价值轮触发 | 历史通知消息 + `notifyAfterSteps/Tools` 配置 | 已实测 |
 | A5 | reenter 不冲突（`setImmediate` 投递） | 历史修复记录 + 无 `session append cannot reenter` 报错 | 已实测 |
 | A6 | 段内累计不被压缩前历史顶满 | 代码：`segmentStart` + 段重置 | 已实测（代码） |
-| A7 | 有单测覆盖 | `node --test tests/*.test.mjs` → `# pass 99 / # fail 0`（aggregate 25 + policy 38 + text 25 + trace-store 11） | 已实测（**2026-09-22 复核复跑：99/99 绿**；旧记的 98 是 09-16 15:20 的快照，此后 `tests/text.test.mjs` 于同日 16:59 增补 1 例而未回写本文） |
+| A7 | 有单测覆盖 | `node --test tests/*.test.mjs` → `# pass 113 / # fail 0`（aggregate 25 + mirror-drift 14 + policy 38 + text 25 + trace-store 11） | 已实测（**2026-09-28 复跑：113/113 绿**；09-22 记的 99 是当时快照，此后 09-28 新增 `tests/mirror-drift.test.mjs` 14 例并回写本文） |
 | A8 | 未知 `kind` 被拒，**不得**当 guidance 放行 | 单测「kind 非法 → 拒绝（fail-closed）」 | 已实测 |
 | A9 | 向后兼容：`guidance`（或缺省）的判定与产物**逐字/逐字节**不变 | 单测「不传 kind 与 kind=guidance 判定完全一致」+ 代码 `kindLine` 仅非 guidance 时非空 | 已实测 |
 | A10 | `workflow` 具体性门槛可证伪（步骤/片段不达即拒） | 单测「kind=workflow：具体性门槛」+ `countNumberedSteps`/`countConcreteSnippets` 单测 | 已实测 |
 | A11 | `kind=tool` **不写** SKILL.md，只写台账 | 代码：`kind==='tool'` 分支在写 SKILL.md 之前 return；单测断言文案含「不写 SKILL.md」 | 已实测（代码 + 单测） |
 | A12 | 台账写入失败**不谎报成功** | 代码：`writeJsonFile` 返回 `false` ⇒ 返回失败 note，且不调用 `markWasted` | 已实测（代码审查） |
 | A13 | 台账**跨会话累积**（不按 sessionId 隔离） | 单测 `skillToolsPath` 与 sessionId 无关 + 与 `skillIndexPath` 形态不同 | 已实测 |
+| A14 | 有漂移时 `skill_commit` 的 note 带读数；无漂移时不打扰 | 单测 `buildDriftNote` 四态（`off`/`clean` ⇒ 空串；`drift` ⇒ 含项数 + 同步命令 + 技能指路 + 「只报数」边界；`unavailable` ⇒ 含故障原因与「未核实」）+ `parseDriftCheck` 以**退出码**为判据（不被输出里的关键字误导） | 已实测（单测 14 例绿 + 2026-09-28 端到端：Windows node 真跑闸门得 `clean`；造真源漂移后得 `drift count=1`） |
+| A15 | **仪器故障不得伪装成「无漂移」**（假绿防线） | 尸体样本：退出码 2（路径缺失）/ 3（真源冲突）⇒ `parseDriftCheck` 返回 `null` ⇒ note 报 `unavailable` 并写「未核实」，**不得**报 clean；项数解析不到 ⇒ 文案「项数未知」而非「0 项」 | 已实测（单测尸体样本）；线上验收随下次真实 `skill_commit` |
 
 ## 8 · 与实现的关系
 
@@ -166,6 +176,13 @@ session/event  ──┬─ user/message   → 记 contextChars（本轮输入�
   - 教训：**D3 是 mtime 判据，不是语义判据**——它只说明「impl 文件被碰过」，碰的是类型层、格式层还是另一条语义，必须逐提交读 diff 才能判。本条即典型假报：**同一 `src/index.ts` 里塞着 DSH 兼容性适配与业务语义两件事**。
 
 - **2026-09-28 D3 复核（0.1.7 平台适配波次 · 判为假报）**：触发提交 `4cb8b40`「fix(0.1.7): MessageSourceMap.plugin 已移除 ⇒ 生产者改自声明 source kind」。逐行对读 `git show 4cb8b40`（+24/−10）后确认改动只有三类：① 新增 `declare module '@deepseek-ai/dsh-llm'` 的 `MessageSourceMap` 声明；② 两处 `source: { kind: 'plugin', plugin: 'X' }` → `{ kind: 'X' }`；③ 收窄 Session 返回类型（去掉 alpha.4 以来无人使用的 `surface`/`events` 字段）并删掉一个永不命中的 `tool-result` 分支。**索引 / 提醒 / 五工具的契约与验收表均未被触及** ⇒ 不为消警而改内容。复核方式可复现：`git -C self-plugins/dsh-agent-skill-forge show 4cb8b40`。
+
+- **2026-09-28 四次实践（镜像漂移闸门 · 触发点工程）**
+  - 语义**被扩充**：新增 `mirrorCheckScript` 配置 + `src/mirror-drift.ts`（纯解析 + 薄 I/O + 纯文案）——`skill_commit`（guidance/workflow）落盘成功后跑一次**只读**闸门，把镜像仓漂移读数追加进返回 `note`
+  - 动因（通用教训）：**纪律写在文档里挡不住复发**。技能真源与资产仓镜像的同步纪律写在资产仓 README 里、工具 `sync-skills.ps1` 也早就存在，却仍复发两次（09-22 把新条目改进镜像而加载的是真源；09-28 积压 6 天 47 项）⇒ 缺的不是工具，是**触发点**；触发点必须长在「我做这件事时必然经过」的位置——对本插件就是 `skill_commit` 的返回体
+  - 设计约束三条：① **只报数，不同步**（同步 = 写镜像仓，属爱丽丝的决策）② **判据单一真源**（漂移判定全交 `sync-skills.ps1 -Check`，不在插件内重算哈希——第二实现就是第二真源）③ **观测不反噬**（`spawnSync` 带 timeout，失败返回 `unavailable` 而非抛错）
+  - 写进单测尸体样本的反模式：**「读不到」不得伪装成「无漂移」**——退出码 2/3 是仪器故障，必须报 `unavailable`。这正是 09-28 修掉的那个假绿形状（旧闸门只对账一个真源域，同一状态报「真源独有技能 0」而事实是 4）
+  - 附带发现（取证教训）：`plugin_inspect` 对本插件返回 `config: {}`，而 patch 实有 7 项 ⇒ **工具的读数是「它读到的域」，不等于真源**；据此直接 `plugin_configure`（整体替换）会抹掉 `compactHintEnabled: false`（违背主人 09-14 定调）。已写入 §4.1 警示
 
 ## 10 · 未决问题
 
