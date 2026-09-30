@@ -49,6 +49,29 @@ export interface CompactionMark {
   candidates: CompactionCandidate[]
 }
 
+/**
+ * `turn` 字段的**唯一判据**：必须是有限 number 才可用。
+ *
+ * 为什么需要单一真源（t-d87c2d54）：同一判据此前散落**三处**各写一遍 ——
+ * ① 采集守卫（`index.ts`）② 载入过滤（`index.ts`）③ 范围过滤（`aggregate.ts`）。
+ * 2026-09-30 修 `null` 漏洞时改了 ①②，**③ 漏网**：`turn === undefined` 挡不住 `null`，
+ * 后者只在 `null < start` 侥幸把 `null` 转成 0 时才被挡下 —— **`start = 0` 时会漏过**，
+ * 并虚增 `eventCount`。⇒ **判据分散 = 必然漂移**，故收敛到本函数，三处共用。
+ *
+ * 实测脏样本形态（每个会话索引文件里恰好一条）：`turn: null` + `endAt: null` +
+ * 事件数极小 + 其余计数全 0。它会经 `createTurnIndex(null)` 落盘，web 重启后
+ * `loadIndexFromDisk` 把它载回内存，`skill_signals` 的输出校验随即整体失败
+ *（`value.turns[N].turn must be a number`）——且**不重启时复现不了**。
+ *
+ * 比 `typeof v === 'number'` 更严的一处：`NaN` 的 `typeof` 也是 `'number'`，
+ * 但它同样会击穿输出校验，故一并拒绝（`Number.isFinite`）。
+ * @param v - 待判定的值
+ * @returns 是否为可用的轮次号（`null` / `undefined` / 字符串 / `NaN` / `Infinity` 一律 false）
+ */
+export function isTurnNumber(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v)
+}
+
 /** 新建轮次索引（时间注入：调用方传 `new Date().toISOString()`） */
 export function createTurnIndex(turn: number, nowIso: string): TurnIndex {
   return { turn, startAt: nowIso, endAt: null, eventCount: 0, toolCalls: 0, errors: 0, estTokens: 0, contextChars: 0 }
@@ -170,7 +193,9 @@ export function buildExtractView(input: {
   for (const event of events) {
     if (event === undefined) continue
     const turn = event.data?.turn
-    if (turn === undefined || turn < start || turn > end) continue
+    // 判据走单一真源（t-d87c2d54）：`turn === undefined` 挡不住 `null` ——
+    // 后者只在 `null < start` 侥幸把 null 转成 0 时才被挡下，`start = 0` 时会漏过并虚增 eventCount
+    if (!isTurnNumber(turn) || turn < start || turn > end) continue
     eventCount += 1
     const t = event.type
     const d = event.data

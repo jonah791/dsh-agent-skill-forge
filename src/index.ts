@@ -46,6 +46,7 @@ import {
   buildSignalsView,
   countCandidateTurns,
   createTurnIndex,
+  isTurnNumber,
   maxTurn,
   selectCompactionCandidates,
 } from './aggregate.js'
@@ -176,8 +177,17 @@ export function apply(ctx: Context, config: Config): void {
         error?: unknown
       }
     }
+    // 2026-09-30 修：原守卫只挡 `undefined`，**不挡 `null`** —— 而某些事件的 `data.turn` 就是 `null`
+    // （实测：**每个会话索引文件里恰好一条**，形态固定 = `turn: null` + `endAt: null` + 事件数极小 +
+    // 其余计数全 0）。它会被 `createTurnIndex(null)` 建成条目并落盘；web 重启后 `loadIndexFromDisk`
+    // 把它载回内存，`skill_signals` 的输出校验随即整体失败
+    // （`value.turns[N].turn must be a number` ⇒ 工具不可用，而**不重启时复现不了**）。
+    // 判据：turn 必须是 number 才采集 —— `null` / `undefined` / 字符串一律丢弃。
+    // 判据：turn 必须是**有限 number** 才采集（`null`/`undefined`/字符串/`NaN` 一律丢弃）。
+    // 收敛到单一真源 `isTurnNumber`（t-d87c2d54）——同一判据曾散落三处，
+    // 2026-09-30 修 null 漏洞时改了这里与载入过滤，**范围过滤那处漏网**。
     const turn = ev.data.turn
-    if (turn === undefined) return
+    if (!isTurnNumber(turn)) return
     let byTurn = indexBySession.get(session.id)
     if (byTurn === undefined) {
       // 重启恢复：采集起点也先读磁盘（否则新 map 只含新 turn，turnsOf 的懒加载
@@ -291,7 +301,13 @@ export function apply(ctx: Context, config: Config): void {
       // 恢复压缩段起点（旧文件无 segment 时保持 0 = 全量统计，兼容历史语义）
       if (data.segment !== undefined && data.segment !== null) segmentBySession.set(session.id, data.segment)
       const map = new Map<number, TurnIndex>()
-      for (const t of data.turns ?? []) map.set(t.turn, t)
+      for (const t of data.turns ?? []) {
+        // 2026-09-30 防御：磁盘上已积累了大量带 `turn: null` 脏条目的历史文件（旧守卫放过 `null`）。
+        // 只修采集侧清不走它们 ⇒ 读取侧必须同样过滤，否则重启后依旧炸 `skill_signals` 的输出校验。
+        // 判据与采集侧一致：turn 必须是 number。
+        if (!isTurnNumber(t?.turn)) continue
+        map.set(t.turn, t)
+      }
       return map
     } catch { return undefined }
   }

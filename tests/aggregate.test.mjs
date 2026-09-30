@@ -14,6 +14,7 @@ import {
   buildSignalsView,
   countCandidateTurns,
   createTurnIndex,
+  isTurnNumber,
   maxTurn,
   segmentLines,
   selectCompactionCandidates,
@@ -249,4 +250,29 @@ test('脏数据：user/message 缺 message 不抛（上下文长度计 0，特�
   assert.equal(view.contextChars, 0)
   assert.deepEqual(view.segments, ['[上下文特征] \n--- 应对轨迹 ---'])
   assert.equal(view.eventCount, 1)
+})
+
+test('t-d87c2d54 turn 判据收敛单一真源：null/NaN 不得混入（含 start=0 漏过场景 + 对照组）', () => {
+  // ① 判据本体 —— 逐值可判假。两处最易漏：
+  //    · null：旧实现靠 `null < start` 把 null 转成 0 侥幸挡住，这不是判据在起作用
+  //    · NaN：`typeof NaN === 'number'` 为真，但它同样会击穿 skill_signals 的输出校验
+  assert.equal(isTurnNumber(3), true)
+  assert.equal(isTurnNumber(0), true)
+  assert.equal(isTurnNumber(null), false, 'null 必须拒')
+  assert.equal(isTurnNumber(undefined), false, 'undefined 必须拒')
+  assert.equal(isTurnNumber('3'), false, '字符串必须拒')
+  assert.equal(isTurnNumber(NaN), false, 'NaN 的 typeof 是 number，但必须拒')
+  assert.equal(isTurnNumber(Infinity), false, 'Infinity 必须拒')
+
+  // ② 真实缺陷回归：范围过滤原用 `turn === undefined`，start=0 时
+  //    `null < 0` 为 false、`null > end` 亦为 false ⇒ 脏事件**漏过**并虚增 eventCount。
+  //    脏样本形态取自事故现场（每个会话索引文件恰好一条）：turn:null + endAt:null + 其余计数全 0。
+  const dirty = { type: 'step/end', data: { turn: null, endAt: null } }
+  const clean = { type: 'step/end', data: { turn: 1 } }
+  const mixed = buildExtractView({ events: [dirty, clean], start: 0, end: 10, maxChars: 1000, linkContext: false })
+  assert.equal(mixed.eventCount, 1, 'start=0 时 turn:null 必须被挡（旧实现会算成 2）')
+
+  // ③ 对照组（该算的必须算）：判据不得过严 —— 正常 turn 必须通过，否则是把真数据一起挡了
+  const ok = buildExtractView({ events: [clean], start: 0, end: 10, maxChars: 1000, linkContext: false })
+  assert.equal(ok.eventCount, 1, '正常 turn 必须通过')
 })
