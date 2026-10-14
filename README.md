@@ -14,7 +14,7 @@
   <a href="https://github.com/jonah791/dsh-agent-skill-forge"><img src="https://img.shields.io/badge/version-0.3.0-blue" alt="version"></a>
   <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
-  <img src="https://img.shields.io/badge/tests-98%20passed-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/tests-118%20passed-brightgreen" alt="tests">
 </p>
 
 **一句话**：把「这次会话里踩过的坑、验证过的流程、该固化的那个脚本」变成下次能直接用的资产——**指导**写成 `SKILL.md`、**具体工作流**写成带步骤与命令的 `SKILL.md`、**工具**登记进工具候选台账等 `plugin_forge` 成形。熔炉只做**采集与落盘**，蒸馏与写入由 agent 本人决定。
