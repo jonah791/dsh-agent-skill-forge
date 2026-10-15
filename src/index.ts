@@ -30,7 +30,11 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { Message } from '@deepseek-ai/dsh-llm'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, writeFileSync, existsSync, readdirSync, readFileSync } from 'node:fs'
+import {
+  auditSkills, parseFrontmatter, hasTriggerSection, renderAudit, DEFAULT_BODY_HEAD,
+  type SkillRecord,
+} from './audit.js'
 import {
   advanceNotifyState,
   decideCompactHint,
@@ -725,7 +729,7 @@ export function apply(ctx: Context, config: Config): void {
       // 差别只在「有人同步过没有」。把读数带进 note = 触发点长在我必然经过的地方
       // （纪律写在文档里挡不住第二次复发，见技能 skill-maintenance §7）。
       // 只报数不同步；探测失败返回 unavailable 而非静默（静默就是又一次假绿）。
-      const driftNote = buildDriftNote(probeMirrorDrift(config.mirrorCheckScript))
+      const driftNote = buildDriftNote(probeMirrorDrift(config.mirrorCheckScript), config.mirrorCheckScript)
       return { path, name, note: note + driftNote }
     },
   })
@@ -794,10 +798,88 @@ export function apply(ctx: Context, config: Config): void {
     },
   })
 
+  // ---------- 工具 5：skill_audit（技能库审计 · 2026-10-15 论文移植）----------
+  /**
+   * 论文依据：SkillFusion（arXiv:2610.15481v1）—— 独立编写的技能联合加载时产生三类交互
+   * （⊕ 硬冲突 / ⊖ 软冲突 / ≡ 冗余），而**合适的处置取决于交互的 type 与 scope**。
+   * ★ 移植的四条判据（消融/审计数据）见 `src/audit.ts` 头注。
+   * ⚠ 本工具**只读**，不改任何技能文件 —— 审计产出候选，**裁决归爱丽丝**（§2.1）。
+   */
+
+  /** 技能目录解析：显式 dir > `~/.agents/skills` > `<cwd>/.agents/skills`（三级全读不到 ⇒ 空串）。 */
+  const resolveSkillsDir = (explicit: string, exec: ToolRunContext): string => {
+    if (explicit !== '') return explicit
+    const home = join(homedir(), '.agents', 'skills')
+    if (existsSync(home)) return home
+    const cwd = exec.agent?.session.header?.cwd
+    if (typeof cwd === 'string' && cwd !== '') {
+      const local = join(cwd, '.agents', 'skills')
+      if (existsSync(local)) return local
+    }
+    return ''
+  }
+
+  /**
+   * 读技能记录（薄 I/O）。
+   * ⚠ **吞错**：单个技能读不到 ⇒ 跳过它，**不因一个坏文件让整次审计失败**（同 `trace-store` 纪律）。
+   * ⚠ 正文只取头部 `DEFAULT_BODY_HEAD` 字符 —— 相似度不需要全文，而 92 KB 的技能全读会拖慢。
+   */
+  const readSkillRecords = (dir: string): SkillRecord[] => {
+    const out: SkillRecord[] = []
+    let names: string[] = []
+    try { names = readdirSync(dir) } catch { return out }
+    for (const d of names.slice().sort()) {
+      let txt = ''
+      try { txt = readFileSync(join(dir, d, 'SKILL.md'), 'utf8') } catch { continue }
+      const fm = parseFrontmatter(txt)
+      out.push({
+        dir: d, name: fm.name, description: fm.description, chars: txt.length,
+        bodyHead: fm.body.slice(0, DEFAULT_BODY_HEAD),
+        hasTrigger: hasTriggerSection(txt),
+      })
+    }
+    return out
+  }
+
+  const auditTool: ToolDefinition = defineTool({
+    name: 'skill_audit',
+    description: '技能库审计（论文移植 · SkillFusion arXiv:2610.15481v1）：扫技能目录报三类 —— '
+      + '≡ 冗余候选（**强证据** = description 与正文都同源；**术语重叠** = 只有描述层证据，**不是结论**）、'
+      + 'scope 缺口（论文消融里影响最大的一维）、结构异常（无 frontmatter / 名不一致 / 超大）。'
+      + '候选生成照论文两段式：**结构剪枝 + 选择性回捞**（全量两两比对更差：假阳多、成本高 —— 论文 Table 2）。'
+      + '⚠ **不判硬/软冲突**：那要读两条指令的行为语义，词法判据到不了那一层。'
+      + '**只读**，不改任何技能文件。',
+    parameters: {
+      dir: { type: 'string', description: '技能目录（缺省 `~/.agents/skills`；再退回 `<cwd>/.agents/skills`）' },
+      maxRows: { type: 'number', description: '每段最多列几行（缺省 15）' },
+      json: { type: 'boolean', description: '输出 JSON（供程序消费；缺省输出可读报告）' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { text: { type: 'string', required: true } },
+      },
+      render: (_args, value) => [{ type: 'text', text: String(value.text ?? '') }],
+    },
+    async execute(args, exec) {
+      const dir = resolveSkillsDir(typeof args.dir === 'string' ? args.dir : '', exec)
+      if (dir === '') {
+        return { text: '（找不到技能目录：既没有 `~/.agents/skills`，也没有 `<cwd>/.agents/skills`）' }
+      }
+      const recs = readSkillRecords(dir)
+      if (recs.length === 0) return { text: '（目录为空或读不到任何 SKILL.md：' + dir + '）' }
+      const rep = auditSkills(recs)
+      if (args.json === true) return { text: JSON.stringify(rep, null, 1) }
+      return { text: renderAudit(rep, { maxRows: typeof args.maxRows === 'number' ? args.maxRows : 15 }) }
+    },
+  })
+
   ctx.tools.register(signalsTool)
   ctx.tools.register(marksTool)
   ctx.tools.register(extractTool)
   ctx.tools.register(commitTool)
   ctx.tools.register(toolsTool)
-  ctx.logger('dsh-agent-skill-forge').info('ready（skill_signals / skill_marks / skill_extract / skill_commit / skill_tools 已注册——被动形态，决策归爱丽丝）')
+  ctx.tools.register(auditTool)
+  ctx.logger('dsh-agent-skill-forge').info('ready（skill_signals / skill_marks / skill_extract / skill_commit / skill_tools / skill_audit 已注册——被动形态，决策归爱丽丝）')
 }

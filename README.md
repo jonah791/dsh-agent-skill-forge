@@ -2,7 +2,7 @@
   DSH 插件生态公约声明（plugin-ecosystem-convention · 组合优先/声明清晰/兼容优先）
   purpose: 被动技能熔炉（Trace2Skill / Ctx2Skill 落地）——后台采集会话轨迹索引（零 LLM 成本）+ 阈值信号送达 + 压缩时刻打炼化候选标记；蒸馏/合并/剪枝决策归爱丽丝；产物三态：guidance/workflow → DSH 技能目录原生可加载的 SKILL.md，tool → 跨会话累积的工具候选台账
   inject: 'tools','agents','memoryApi'
-  tools: skill_signals, skill_marks, skill_extract, skill_commit, skill_tools
+  tools: skill_signals, skill_marks, skill_extract, skill_commit, skill_tools, skill_audit
   runtime: host-only
   envDeps: 无强依赖（纯逻辑 + 标准 Node）；可选：dsh-agent-memory（memoryApi 缺省时技能索引回流被静默跳过，SKILL.md 仍是权威存储）
   boundary: 只采集与建议，**不蒸馏、不合并、不自动写产物**（写动作只有两处且都需显式调用：skill_commit 落产物、skill_tools 流转候选状态）；工具引用校验只覆盖「系统工具面 + 本进程见过的工具」
@@ -46,6 +46,7 @@
 | `skill_extract` | 提取轨迹（只读）：按 turn 范围从会话事件流提取事件序列文本（用户消息/模型动作/工具调用/结果与错误），供爱丽丝蒸馏分析。零 LLM 调用（纯数据提取）。`linkContext=true`（缺省）时输出联动视图，供蒸馏「上下文特征 → 应对策略」条件化技能。`startTurn` 必需；`endTurn` 缺省 = `startTurn`；`maxChars` 缺省 20000（超长分段返回） |
 | `skill_commit` | 把轨迹蒸馏产物落盘（**可写**）。产物类型由 `kind` 决定：`guidance` → SKILL.md；`workflow` → SKILL.md（frontmatter 带 kind）；`tool` → 工具候选台账。guidance/workflow 默认写 `~/.agents/skills/<name>/SKILL.md`，`scope=project` 写 `<cwd>/.agents/skills/`。纪律：技能只提供指导（决策/流程/规避），不提供工具——正文引用的工具限于系统工具面（提交时自动校验，幻觉工具会警告）。`turns` 声明的轮次提交后标记为**废渣**。落盘成功后若配了 `mirrorCheckScript`，会跑一次**只读**闸门并把镜像仓漂移读数追加进回执（只报数，不同步） |
 | `skill_tools` | 工具候选台账（读 + 流转）：`skill_commit(kind=tool)` 的产物。不传 `tool` 列全部候选（含状态计数）；只传 `tool` 看详情；传 `tool` + `status`/`plugin`/`note` 则流转该候选（`candidate` → `forged`/`abandoned`）。台账**跨会话累积**，不随会话结束蒸发 |
+| `skill_audit` | 技能库审计（**只读** · 2026-10-15 论文移植）：扫技能目录报三类 —— ≡ 冗余候选（**强证据** = description 与正文都同源；**术语重叠** = 只有描述层证据，**不是结论**）、scope 缺口（论文消融里影响最大的一维）、结构异常（无 frontmatter / 名不一致 / 超大）。候选生成照论文两段式：**结构剪枝 + 选择性回捞**（全量两两比对更差：假阳多、成本高）。⚠ **不判硬/软冲突** —— 那要读两条指令的行为语义，词法判据到不了那一层。论文依据：SkillFusion（arXiv:2610.15481v1） |
 
 背景行为（无工具面，自动发生）：
 

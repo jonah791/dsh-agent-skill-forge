@@ -1,0 +1,281 @@
+/**
+ * audit.ts 单测 —— 技能库审计层（纯函数）。
+ *
+ * 纪律（SOUL §5.9 规则 2）：**新防线必带尸体测试**，且必须有**金标准**
+ * （无关技能 ⇒ 零候选）——否则「恒亮的判据不是证据」。
+ *
+ * ★ 本组里最要紧的是 **C 组（有意指针 vs 真冗余）** 与 **D2（回捞真的捞到了）**：
+ *   前者对应论文 Table 2 的教训（No gate 的 24 个假阳 = 把本来有用的东西当冲突），
+ *   后者对应判据②（严剪漏 24/60，回捞捞回 14）。
+ *
+ * 运行：`npm run build && node --test tests/audit.test.mjs`
+ */
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import {
+  auditSkills,
+  bodySimilarity,
+  hasTriggerSection,
+  isIntentionalPointer,
+  jaccard,
+  parseFrontmatter,
+  renderAudit,
+  shingleSet,
+  tokenSet,
+  NEAR_DUP_BODY_THRESHOLD,
+} from '../lib/audit.js'
+
+/** 造一条技能记录（只给审计层需要的字段）。 */
+const rec = (dir, description, over = {}) => ({
+  dir,
+  name: dir,
+  description,
+  chars: 1000,
+  hasTrigger: true,
+  ...over,
+})
+
+/* ── A 金标准：判据不得恒亮 ─────────────────────────────────────────────── */
+
+test('A1 两个完全无关的技能（不同前缀、词不重叠、正文不同）⇒ 零候选', () => {
+  const rep = auditSkills([
+    rec('alpha-thing', '数据库迁移与回滚的实操纪律', { bodyHead: '第一节 迁移脚本必须先备份再执行' }),
+    rec('zeta-other', '语音合成与音色选择', { bodyHead: '第二节 采样率与比特率的取舍' }),
+  ])
+  assert.equal(rep.pairs.length, 0, '无关技能不得产生任何候选（否则判据恒亮）')
+  assert.equal(rep.stats.candidates, 0)
+})
+
+test('A2 同前缀 ⇒ 进候选池，但内容不同 ⇒ **不报冗余**（剪枝 ≠ 判定）', () => {
+  const rep = auditSkills([
+    rec('dsh-alpha', '插件 A 的部署流程', { bodyHead: '甲甲甲甲甲 内容一' }),
+    rec('dsh-beta', '完全另一件事的网络排障', { bodyHead: '乙乙乙乙乙 内容二' }),
+  ])
+  assert.equal(rep.stats.candidates, 1, '同前缀必须进候选池（剪枝的作用）')
+  assert.equal(rep.pairs.length, 0, '但内容不同就不该报冗余 —— 剪枝只决定「看什么」，不决定「是什么」')
+})
+
+/* ── B 尸体：每一类都必须报 ─────────────────────────────────────────────── */
+
+test('B1 尸体·description 逐字相同（非指针）⇒ duplicate-desc，且 intentional=false', () => {
+  const d = '把外部论文的结论移植到本机的取证流程'
+  const rep = auditSkills([rec('aaa-one', d), rec('bbb-two', d)])
+  const hit = rep.pairs.find((p) => p.kind === 'duplicate-desc')
+  assert.ok(hit !== undefined, '逐字相同的 description 必须被报出')
+  assert.equal(hit.intentional, false, '非指针 ⇒ 不算「有意」，应进「值得看」清单')
+})
+
+test('B2 尸体·description 词集高度重叠 ⇒ near-duplicate-desc', () => {
+  const rep = auditSkills([
+    rec('p-one', '浏览器自动化验证：用无头浏览器做界面验收与截图复核'),
+    rec('p-two', '浏览器自动化验证：用无头浏览器做界面验收与截图核对'),
+  ])
+  assert.ok(rep.pairs.some((p) => p.kind === 'near-duplicate-desc'), '近重复 description 必须被报出')
+})
+
+test('B3 尸体·无 description ⇒ no-description（严重档）', () => {
+  const rep = auditSkills([rec('x-nod', '', { hasTrigger: false })])
+  assert.equal(rep.scopeGaps.filter((g) => g.kind === 'no-description').length, 1)
+})
+
+test('B4 尸体·name ≠ 目录名 ⇒ name-mismatch（索引漂移）', () => {
+  const rep = auditSkills([rec('dir-name', '有描述', { name: 'frontmatter-name' })])
+  const a = rep.anomalies.find((x) => x.kind === 'name-mismatch')
+  assert.ok(a !== undefined, '目录名与 frontmatter name 不一致必须报出')
+  assert.match(a.detail, /frontmatter-name/)
+})
+
+test('B5 尸体·超大技能 ⇒ oversized，且文案里**明确不建议压缩**（论文判据④）', () => {
+  const rep = auditSkills([rec('big-one', '很大', { chars: 40000 })])
+  const a = rep.anomalies.find((x) => x.kind === 'oversized')
+  assert.ok(a !== undefined)
+  assert.match(a.detail, /只报告不建议压缩/, '必须带上论文依据，否则读者会顺手去压缩')
+})
+
+test('B6 尸体·无 frontmatter ⇒ no-frontmatter', () => {
+  const rep = auditSkills([rec('no-fm', '', { name: '' })])
+  assert.ok(rep.anomalies.some((x) => x.kind === 'no-frontmatter'))
+})
+
+/* ── C ★ 有意指针 vs 真冗余（论文 Table 2 的教训）───────────────────────── */
+
+test('C1 有意指针（「已熔炼进…防呆指针」）⇒ intentional=true，不进「值得看」', () => {
+  const d = '已熔炼进 dsh-upgrade-adaptation 的防呆指针；本目录保留为上游资源树。'
+  const rep = auditSkills([rec('aaa-p', d), rec('bbb-q', d)])
+  const hit = rep.pairs.find((p) => p.kind === 'duplicate-desc')
+  assert.ok(hit !== undefined)
+  assert.equal(hit.intentional, true, '有意的占位符必须被单独标记')
+  assert.equal(rep.stats.intentional, 1)
+})
+
+test('C2 同一条描述里，指针与非指针**分开统计**（不混成一个数）', () => {
+  const ptr = '已熔炼进某插件的防呆指针；本目录保留为上游资源树。'
+  const real = '完全另一件事的重复描述，两边都不是指针。'
+  const rep = auditSkills([
+    rec('a1', ptr), rec('a2', ptr),      // 一对指针
+    rec('b1', real), rec('b2', real),    // 一对真冗余
+  ])
+  assert.equal(rep.stats.intentional, 1, '指针那一对应被计入 intentional')
+  assert.equal(rep.pairs.filter((p) => !p.intentional).length, 1, '真冗余那一对应留在可行动清单里')
+})
+
+test('C3 isIntentionalPointer 判据：命中标记词才为真（不得恒真）', () => {
+  assert.equal(isIntentionalPointer('已熔炼进 X 的防呆指针；本目录保留为上游资源树'), true)
+  assert.equal(isIntentionalPointer('这是一份正常的技能描述，讲的是取证流程'), false)
+})
+
+/* ── D ★ 剪枝与回捞（判据②③的直接验证）────────────────────────────────── */
+
+test('D1 剪枝真的省：跨域技能互不相干 ⇒ 候选数远小于全量对数', () => {
+  // ⚠ 样本设计教训（第一版被我写错）：第一版造 30 条**全部同前缀**（mod0-item / mod1-item…）
+  //   ⇒ 前缀剪枝必然全命中 ⇒ 候选数 == 全量对数，测的根本不是「剪枝省不省」。
+  //   真实技能库的形态是**域各异**（anima / weather / robotics…）—— 照那个形态造样本才有意义。
+  const recs = [
+    rec('anima-nsfw', '涩图生成配方与提交链', { bodyHead: '基模选择与开关匹配' }),
+    rec('weather-data', '气象数据的单位与时区口径', { bodyHead: '露点与风寒公式' }),
+    rec('robotics-motion', '机器人运动学与轨迹', { bodyHead: '正逆解往返与限位' }),
+    rec('voice-speech', '语音合成与音色选择', { bodyHead: '采样率与比特率取舍' }),
+    rec('latex-table', '表格挤成竖条的治本', { bodyHead: '估宽判据与跨页' }),
+    rec('k8s-runbook', 'K8s 排障分诊表', { bodyHead: '三拍取证与判据' }),
+  ]
+  const rep = auditSkills(recs)
+  assert.equal(rep.stats.allPairs, 15, '6 个技能的全量对数是 15')
+  assert.ok(rep.stats.candidates < rep.stats.allPairs, '剪枝必须真的省（否则退化成 No gate）')
+})
+
+test('D2 尸体·**回捞**：词集无交集但正文高度重叠 ⇒ 必须被捞回（跨前缀）', () => {
+  // ⚠ 样本设计教训（第一版被我写错）：第一版两条描述是「甲方案：证据链的核对方式」/「乙方案：…」
+  //   —— 它们**共享「方案」二字** ⇒ descSim > 0 ⇒ 走的是「候选池内」路径，**根本没测到回捞**。
+  //   要测回捞，描述必须**词集完全无交集**（英文词互不共享 3-gram 最省事）。
+  const body = '验收判据必须逐字对照原文。判据设计三问：它会被哪一次测量判真假？证据是落盘的还是别人说的？异常状态为什么是这样？'
+  const rep = auditSkills([
+    rec('alpha-x', 'alpha unique marker', { bodyHead: body }),
+    rec('omega-y', 'bravo distinct token', { bodyHead: body }),
+  ])
+  const hit = rep.pairs.find((p) => p.kind === 'near-duplicate-body')
+  assert.ok(hit !== undefined, '词不重叠但正文同源的对必须被回捞（否则就是论文里严剪漏掉的那 24/60）')
+  assert.match(hit.evidence, /回捞/)
+  assert.ok(hit.score >= NEAR_DUP_BODY_THRESHOLD)
+})
+
+test('D3 回捞不得恒捞：正文不同的跨前缀对，仍然不报', () => {
+  const rep = auditSkills([
+    rec('alpha-z', '甲', { bodyHead: '完全不同的内容一：' + '甲'.repeat(200) }),
+    rec('omega-w', '乙', { bodyHead: '完全不同的内容二：' + '乙'.repeat(200) }),
+  ])
+  assert.equal(rep.pairs.filter((p) => p.kind === 'near-duplicate-body').length, 0)
+})
+
+/* ── E 可复算（无时钟、无随机）─────────────────────────────────────────── */
+
+test('E1 同一输入跑两次结果逐字一致', () => {
+  const recs = [
+    rec('aaa-one', '描述甲甲乙乙'), rec('aaa-two', '描述甲甲乙乙'),
+    rec('bbb-three', '另一个描述'), rec('ccc-four', '', { hasTrigger: false }),
+  ]
+  const a = JSON.stringify(auditSkills(recs))
+  const b = JSON.stringify(auditSkills(recs))
+  assert.equal(a, b, '审计层必须可复算（同目录两次跑出同一份读数）')
+})
+
+/* ── F parseFrontmatter ──────────────────────────────────────────────── */
+
+test('F1 正常 frontmatter：name / description / body 正确切分', () => {
+  const t = '---\nname: my-skill\ndescription: 一句话说明\n---\n\n# 标题\n正文内容\n'
+  const r = parseFrontmatter(t)
+  assert.equal(r.hasFrontmatter, true)
+  assert.equal(r.name, 'my-skill')
+  assert.equal(r.description, '一句话说明')
+  assert.match(r.body, /正文内容/)
+  assert.ok(!r.body.includes('name: my-skill'), 'body 不得含 frontmatter')
+})
+
+test('F2 无 frontmatter ⇒ hasFrontmatter=false 且 name/description 为空串（不猜）', () => {
+  const r = parseFrontmatter('# 只有标题\n正文\n')
+  assert.equal(r.hasFrontmatter, false)
+  assert.equal(r.name, '')
+  assert.equal(r.description, '')
+  assert.equal(r.body, '# 只有标题\n正文\n')
+})
+
+test('F3 有 frontmatter 但缺 description ⇒ 空串（「没写」与「写了空」在读数上一致，都是没声明）', () => {
+  const r = parseFrontmatter('---\nname: only-name\n---\n正文\n')
+  assert.equal(r.hasFrontmatter, true)
+  assert.equal(r.name, 'only-name')
+  assert.equal(r.description, '')
+})
+
+/* ── G 词法工具与边界 ─────────────────────────────────────────────────── */
+
+test('G1 tokenSet：中英混合都取得到（中文二元组 + 英文词）', () => {
+  const t = tokenSet('浏览器 automation 验收')
+  assert.ok(t.has('浏览') || t.has('览器'), '中文应被切成二元组')
+  assert.ok(t.has('automation'), '英文词应被保留')
+})
+
+test('G2 jaccard / shingleSet / bodySimilarity：退化输入不抛', () => {
+  assert.equal(jaccard(new Set(), new Set(['a'])), 0)
+  assert.equal(jaccard(new Set(), new Set()), 0)
+  assert.equal(shingleSet('').size, 0)
+  assert.equal(bodySimilarity('', ''), 0)
+  assert.equal(bodySimilarity('同一段文字', '同一段文字'), 1)
+})
+
+test('G3 hasTriggerSection：多种措辞都认（放宽匹配是刻意的）', () => {
+  assert.equal(hasTriggerSection('## 一、何时进入本技能（触发条件）'), true)
+  assert.equal(hasTriggerSection('**触发**：改代码后'), true)
+  assert.equal(hasTriggerSection('**适用场景**：批量替换'), true)
+  assert.equal(hasTriggerSection('这是一段没有任何触发说明的文字'), false)
+})
+
+test('G4 空库 / 单技能 ⇒ 不崩、零候选', () => {
+  const empty = auditSkills([])
+  assert.equal(empty.total, 0)
+  assert.equal(empty.stats.allPairs, 0)
+  assert.equal(empty.pairs.length, 0)
+  const one = auditSkills([rec('solo', '唯一的技能')])
+  assert.equal(one.total, 1)
+  assert.equal(one.pairs.length, 0)
+})
+
+/* ── H 渲染（可读性 + 边界声明不得丢）────────────────────────────────── */
+
+test('H1 renderAudit：报告含边界声明（不判硬/软冲突）——不得静默省略', () => {
+  const rep = auditSkills([rec('aaa-one', '描述'), rec('bbb-two', '另一个')])
+  const txt = renderAudit(rep)
+  assert.match(txt, /不判硬\/软冲突/, '边界必须出现在输出里，否则读者会以为审计覆盖了冲突')
+  assert.match(txt, /scope 质量/, 'scope 必须单列（论文消融第一重要的维度）')
+})
+
+test('H2 renderAudit：零候选时也说明「有意指针是被主动排除的」（空必须分型）', () => {
+  const d = '已熔炼进 X 的防呆指针；本目录保留为上游资源树。'
+  const rep = auditSkills([rec('aaa-p', d), rec('bbb-q', d)])
+  const txt = renderAudit(rep)
+  assert.match(txt, /有意指针/, '指针被排除这件事必须可见，否则「零可行动」会被读成「没检出」')
+})
+
+test('H3 severity=strong：正文也同源的对进「强证据」段（多证据合取）', () => {
+  const body = '验收判据必须逐字对照原文。判据设计三问：它会被哪一次测量判真假？'
+  const rep = auditSkills([
+    rec('alpha-s', 'alpha unique marker', { bodyHead: body }),
+    rec('omega-s', 'bravo distinct token', { bodyHead: body }),
+  ])
+  const hit = rep.pairs.find((p) => p.kind === 'near-duplicate-body')
+  assert.ok(hit !== undefined)
+  assert.equal(hit.severity, 'strong', '正文同源 ⇒ 多证据合取 ⇒ strong')
+  assert.match(renderAudit(rep), /强证据/)
+})
+
+test('H4 severity=weak：只有 description 证据的对**不得冒充结论**（渲染必须降档）', () => {
+  // 同域（plugin-*）+ 词高度重叠，但正文完全不同 ⇒ 典型「同域术语重叠」
+  const rep = auditSkills([
+    rec('plugin-aaa', '浏览器自动化验证：用无头浏览器做界面验收与截图复核', { bodyHead: '甲'.repeat(300) }),
+    rec('plugin-bbb', '浏览器自动化验证：用无头浏览器做界面验收与截图核对', { bodyHead: '乙'.repeat(300) }),
+  ])
+  const hit = rep.pairs.find((p) => p.kind === 'near-duplicate-desc')
+  assert.ok(hit !== undefined, '近重复 description 仍要报（信号不能丢）')
+  assert.equal(hit.severity, 'weak', '正文不同源 ⇒ 只有单层证据 ⇒ weak')
+  const txt = renderAudit(rep)
+  assert.match(txt, /术语重叠/, 'weak 档必须降档呈现')
+  assert.match(txt, /不是结论/, '必须写清它不构成结论 —— 否则读者会把同域术语重叠当冗余去改')
+})
