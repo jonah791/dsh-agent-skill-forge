@@ -98,6 +98,22 @@ test('drift ⇒ 含项数 + 同步命令 + 技能指路 + 「只报数」边界'
   assert.match(note, /只报数/)
 })
 
+// 2026-10-09 实测缺陷：文案曾写死 `scripts/sync-skills.ps1`，而真身在镜像仓内
+// （`repos/alice-self-assets/scripts/`）⇒ 提示指向不存在的路径，白费一次调用。
+// 判据：给了配置路径就必须原样用它（配置与探测同一真源），不许硬编码第二份。
+test('drift + 已配置路径 ⇒ 文案用配置里那个路径，不硬编码', () => {
+  const p = 'E:\\alice\\repos\\alice-self-assets\\scripts\\sync-skills.ps1'
+  const note = buildDriftNote({ kind: 'drift', reading: { count: 3, summary: '有漂移（3 项）' } }, p)
+  assert.ok(note.includes(p), '配置路径未出现在文案里：' + note)
+  assert.doesNotMatch(note, /`scripts\/sync-skills\.ps1`/, '仍硬编码着错路径')
+})
+
+test('尸体：未配置路径时退化为裸脚本名（不留悬空的反引号路径）', () => {
+  const note = buildDriftNote({ kind: 'drift', reading: { count: 1, summary: '' } }, '   ')
+  assert.match(note, /`sync-skills\.ps1`/)
+  assert.doesNotMatch(note, /``/)
+})
+
 test('尸体：项数未知时不得显示「0 项」（不猜数字）', () => {
   const note = buildDriftNote({ kind: 'drift', reading: { count: -1, summary: '' } })
   assert.match(note, /项数未知/)

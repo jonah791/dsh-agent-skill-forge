@@ -55,15 +55,21 @@ export function parseDriftCheck(exitCode: number, stdout: string): DriftReading 
 }
 
 /** 纯文案：探测结果 → 追加到 `skill_commit` note 的片段（无内容时为空串，"无消息即好消息"） */
-export function buildDriftNote(probe: DriftProbe): string {
+export function buildDriftNote(probe: DriftProbe, scriptPath?: string): string {
   if (probe.kind === 'off' || probe.kind === 'clean') return ''
   if (probe.kind === 'unavailable') {
     return '\n\n⚠ 镜像漂移闸门不可用（' + probe.reason + '）——本次提交后**未核实**镜像仓是否落后'
   }
   const n = probe.reading.count
   const countText = n < 0 ? '项数未知' : n + ' 项'
+  // 路径取自**配置**（与探测同一真源），不硬编码。
+  // 2026-10-09 实测：旧版文案写死 `scripts/sync-skills.ps1`，而真身在镜像仓内
+  // （`repos/alice-self-assets/scripts/`）⇒ 提示指向一个不存在的路径，白费一次调用。
+  // 硬编码路径就是第二真源（source-of-truth 缺陷）；未配置时才退化为裸脚本名。
+  const raw = (scriptPath ?? '').trim()
+  const target = raw === '' ? '`sync-skills.ps1`' : '`' + raw + '`'
   return (
-    '\n\n⚠ 镜像仓漂移 ' + countText + '——跑 `scripts/sync-skills.ps1` 同步' +
+    '\n\n⚠ 镜像仓漂移 ' + countText + '——跑 ' + target + ' 同步' +
     '（纪律与命令序见技能 `skill-maintenance` §7；本闸门只报数，同步与否由爱丽丝决定）'
   )
 }
