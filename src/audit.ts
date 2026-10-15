@@ -77,6 +77,25 @@ export interface ScopeGap {
   kind: 'no-description' | 'no-trigger-section'
 }
 
+/**
+ * scope 风险 —— **可行动**的清单，替代「无触发段 N/186」这个没有行动性的读数。
+ *
+ * 判据：`description 无 scope 信号` ∧ `存在词法近邻`（合取，两个条件都要）。
+ * 依据：论文消融第一维是 scope（去 scope normalization ⇒ Success .799→.768，跌幅最大），
+ *   而 **scope 的作用是「区分」** —— 只有存在混淆可能时，缺 scope 才有害。
+ *   孤立域技能（词法上无近邻）缺触发词不影响选择 ⇒ **不进清单**（否则 133 条全是待办 = 没有待办）。
+ *
+ * ⚠ 近邻只算**非 intentional** 的对：`dsh-benchmark-case ↔ dsh-upgrade-audit ↔ plugin-upgrade`
+ *   三条 description 逐字相同（Jaccard=1.0），那是**有意**的防呆占位符，不是 scope 缺陷。
+ */
+export interface ScopeRisk {
+  dir: string
+  /** 最近的词法近邻（非 intentional 对里的最大 Jaccard） */
+  maxNeighbor: number
+  /** 那个近邻是谁 */
+  neighbor: string
+}
+
 /** 结构异常。 */
 export interface Anomaly {
   dir: string
@@ -88,6 +107,8 @@ export interface AuditReport {
   total: number
   pairs: PairFinding[]
   scopeGaps: ScopeGap[]
+  /** scope 风险（无信号 ∧ 有近邻）—— **可行动清单**，按近邻相似度降序 */
+  scopeRisks: ScopeRisk[]
   anomalies: Anomaly[]
   stats: {
     /** 候选对总数（剪枝 + 回捞）；论文 Table 2 用同一口径对比 SF-strict / SF-final / No gate */
@@ -124,6 +145,33 @@ export const TRIGGER_MARKERS: readonly string[] = [
   '何时用',
 ]
 
+/**
+ * description 层的「何时用」信号词 —— **只有这些才算 scope 声明**。
+ *
+ * ★ **标定读数（2026-10-15 · 真实 186 技能库 · 人读逐条核对）**：
+ *   宽松表（含裸 `用于` / `触发`）命中 15 条，**精确率仅 8/15** —— 假阳全是**内容特征**被误读：
+ *   `规则有适用域`（comparative-config-experiment）· `**触发可达**`（mechanism-fit-validation）·
+ *   `能否用于自己的框架`（external-corpus-fitness）· `提醒有触发条件`（personal-assistant-ops）。
+ *   ⇒ 取严：这里下游是**写操作**（补 description），假阳 = 白改一条 + **永久**加长每步注入开销；
+ *     假阴性 = 漏一个该补的（但它仍然可发现，只是不如最优）—— 代价不对称（AGENTS.md §5.9）。
+ *   去掉裸 `用于` / `触发` 后 **8/8 全真**；漏掉 `用于迭代预设…`（context-effect-research）两例，
+ *   但它们无词法近邻 ⇒ 不进高优先清单，漏判无后果。
+ *
+ * ⚠ 本表只查 **description**（技能目录里唯一被读到的一句）；正文级的触发段走 `TRIGGER_MARKERS`。
+ */
+export const SCOPE_SIGNAL_MARKERS: readonly string[] = [
+  'use when',
+  'use for',
+  'use this',
+  'when to use',
+  '何时用',
+  '何时别',
+  '何时不',
+  '适用于',
+  '适用场景',
+  '什么时候用',
+]
+
 /** 缺省：正文级相似度只在候选对内算，且只取正文头部这么多字符（控制开销）。 */
 export const DEFAULT_BODY_HEAD = 4000
 /**
@@ -147,6 +195,21 @@ export const DESC_PRUNE_MIN = 0.05
  *     所以命中的对只标「值得看」，**不标缺陷**。
  */
 export const NEAR_DUP_DESC_THRESHOLD = 0.15
+/**
+ * ⚠ **IDF 加权的负结果（2026-10-15 · 不要重试）**。
+ *
+ * 动机：模板词制造虚假相似度 —— 实测 `判据` 出现在 **87/186** 个技能的 description 里（df=47%），
+ *   `实测` 54 · `纪律` 43。直觉是「按信息量加权，模板词自动降权」。
+ *
+ * 量完的读数（186 技能 · 17205 对 · 脚本读全部 description 算 df → 加权交/加权并）：
+ *   · 值域确实被压低：被报的 4 对降 22–27%（0.189→0.147 · 0.182→0.141 · 0.161→0.117 · 0.158→0.127）；
+ *   · 但**排名几乎不变**（4→4 · 5→5 · 6→7 · 7→6）—— IDF 是**全局缩放**，不改变相对排序；
+ *   · 阈值敏感度：`≥0.05` 235→64 对，`≥0.15` 7→3 对（那 3 对是逐字相同的有意指针）。
+ *   ⇒ 对「减少假阳」**无实质帮助**，不值得动判据。
+ *
+ * 结论：模板词污染是**真的**，但它不是假阳的主因 —— 那几对的相似度主要来自**真实的领域词重叠**
+ *   （`plugin-*` 都讲插件），而**同域共享术语是正常的**（所以本档只标「值得看」，不标缺陷）。
+ */
 /**
  * 正文 shingle 相似度阈值。
  *
@@ -188,9 +251,21 @@ export function isIntentionalPointer(...texts: readonly string[]): boolean {
   return INTENTIONAL_MARKERS.some((k) => all.includes(k))
 }
 
-/** 是否含显式触发条件段。 */
+/** 是否含显式触发条件段（**正文**级，查全文）。 */
 export function hasTriggerSection(text: string): boolean {
   return TRIGGER_MARKERS.some((k) => text.includes(k))
+}
+
+/**
+ * description 是否声明了「何时用」（**description** 级 —— 技能目录里唯一被读到的一句）。
+ *
+ * ⚠ 与 `hasTriggerSection` 的域**不同**，两者不可互相替代：后者查正文全文，本函数只查 description。
+ *   实测 `customer-support-ops` 正文有触发段、description 没有 —— 而读者（包括未来的我）
+ *   在技能目录里**只看得见 description**，正文常没人翻（技能维护规范 §3.1）。
+ */
+export function hasScopeSignal(description: string): boolean {
+  const s = description.toLowerCase()
+  return SCOPE_SIGNAL_MARKERS.some((k) => s.includes(k))
 }
 
 /**
@@ -328,6 +403,30 @@ export function auditSkills(records: readonly SkillRecord[], opts: {
     else if (r.hasTrigger === false) scopeGaps.push({ dir: r.dir, kind: 'no-trigger-section' })
   }
 
+  // ── scope 风险：无信号 ∧ 有近邻（**合取**）────────────────────────────────
+  // 为什么是合取：scope 的作用是「区分」——孤立域技能缺触发词不影响选择（133 条全列 = 没有待办）。
+  // ⚠ 近邻只取 **description 层**且 **非 intentional** 的对：
+  //   · body-kind 的 `score` 是正文相似度，不是词法近邻（拿它当门槛是串了尺子）；
+  //   · 有意指针（`dsh-benchmark-case ↔ dsh-upgrade-audit ↔ plugin-upgrade` 逐字相同）是**有意**的。
+  const best = new Map<string, { sim: number; who: string }>()
+  for (const p of pairs) {
+    if (p.intentional) continue
+    if (p.kind !== 'duplicate-desc' && p.kind !== 'near-duplicate-desc') continue
+    const sides: ReadonlyArray<readonly [string, string]> = [[p.a, p.b], [p.b, p.a]]
+    for (const [me, other] of sides) {
+      const cur = best.get(me)
+      if (cur === undefined || p.score > cur.sim) best.set(me, { sim: p.score, who: other })
+    }
+  }
+  const scopeRisks: ScopeRisk[] = []
+  for (const r of recs) {
+    if (r.description === '' || hasScopeSignal(r.description)) continue
+    const b = best.get(r.dir)
+    if (b === undefined) continue
+    scopeRisks.push({ dir: r.dir, maxNeighbor: b.sim, neighbor: b.who })
+  }
+  scopeRisks.sort((x, y) => y.maxNeighbor - x.maxNeighbor || (x.dir < y.dir ? -1 : 1))
+
   const anomalies: Anomaly[] = []
   for (const r of recs) {
     if (r.name === '' && r.description === '') {
@@ -348,6 +447,7 @@ export function auditSkills(records: readonly SkillRecord[], opts: {
     total: n,
     pairs: pairs.sort((x, y) => y.score - x.score),
     scopeGaps,
+    scopeRisks,
     anomalies,
     stats: {
       candidates,
@@ -408,8 +508,19 @@ export function renderAudit(rep: AuditReport, opts: { maxRows?: number } = {}): 
   L.push('scope 质量（论文消融第一重要的维度）｜无 description ' + noDesc.length
     + ' · 无显式触发段 ' + noTrig.length + '/' + rep.total)
   if (noDesc.length > 0) for (const g of noDesc.slice(0, max)) L.push('  ✖ ' + g.dir + '：**无 description** ⇒ 技能目录里看不见它')
-  L.push('  ⓘ 「无显式触发段」是**提示不是缺陷**：description 本身已承担粗粒度 scope。'
-    + '要补的是「何时**不**适用」与「与谁重叠」——那是 description 装不下的部分。')
+  // ── 可行动清单：无信号 ∧ 有近邻（合取）────────────────────────────────────
+  if (rep.scopeRisks.length > 0) {
+    L.push('  ★ **高优先（最易选错）' + rep.scopeRisks.length + ' 条** —— description 里没有「何时用」，'
+      + '而词法上又有近邻（门槛 ' + NEAR_DUP_DESC_THRESHOLD + '，与冗余档**同一把尺子**）：')
+    for (const s of rep.scopeRisks.slice(0, max)) {
+      L.push('      · ' + s.dir + '（近邻 ' + s.neighbor + ' ' + s.maxNeighbor.toFixed(3) + '）')
+    }
+    if (rep.scopeRisks.length > max) L.push('      …（还有 ' + (rep.scopeRisks.length - max) + ' 条）')
+    L.push('    ⇒ 动作：把正文里**已有**的边界声明（反定位「不做 X → 归谁」）提升到 description')
+  }
+  L.push('  ⓘ 其余 ' + (rep.total - noDesc.length - rep.scopeRisks.length) + ' 条**不需要动**：'
+    + '要么 description 已声明「何时用」，要么词法上无近邻（域内孤立）。'
+    + 'scope 的作用是**区分** —— 没有混淆可能时补它没有收益（否则 133 条全是待办 = 没有待办）。')
 
   L.push('')
   L.push('结构异常｜' + rep.anomalies.length + ' 条')

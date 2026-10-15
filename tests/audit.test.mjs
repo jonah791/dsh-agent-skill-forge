@@ -15,6 +15,7 @@ import assert from 'node:assert/strict'
 import {
   auditSkills,
   bodySimilarity,
+  hasScopeSignal,
   hasTriggerSection,
   isIntentionalPointer,
   jaccard,
@@ -278,4 +279,78 @@ test('H4 severity=weak：只有 description 证据的对**不得冒充结论**�
   const txt = renderAudit(rep)
   assert.match(txt, /术语重叠/, 'weak 档必须降档呈现')
   assert.match(txt, /不是结论/, '必须写清它不构成结论 —— 否则读者会把同域术语重叠当冗余去改')
+})
+
+/* ── I scope 风险：无信号 ∧ 有近邻（**合取**）────────────────────────────────
+ * 为什么是合取：scope 的作用是**区分** —— 孤立域技能缺触发词不影响选择。
+ * 如果只按「无信号」报，133/186 条全是待办 = 没有待办（读数没有行动性）。
+ */
+
+test('I1 hasScopeSignal 金标准：英文/中文的「何时用」都认', () => {
+  assert.equal(hasScopeSignal('Debug X. Use when host API semantics matter.'), true)
+  assert.equal(hasScopeSignal('Coordinate the lifecycle. Use for guided workflows.'), true)
+  assert.equal(hasScopeSignal('移动端 Expo + 何时用 Expo'), true)
+  assert.equal(hasScopeSignal('适用于任何「超限静默截断」的文件'), true)
+})
+
+test('I2 尸体·**内容特征词不得冒充「何时用」**（标定抓到的 4 个实测假阳）', () => {
+  // 这四条在宽松表（含裸 `用于`/`触发`）下会被误报 —— 人读逐条核对才抓出来（精确率 8/15）
+  assert.equal(hasScopeSignal('跨配置对照实验的设计纪律：…、规则有适用域'), false, '「适用域」≠「适用于」')
+  assert.equal(hasScopeSignal('选场景三条判据（重复性/回报可判定/**触发可达**）'), false, '「触发可达」是内容特征')
+  assert.equal(hasScopeSignal('评估外部数据集/语料能否用于自己的框架或研究'), false, '「能否用于」是内容')
+  assert.equal(hasScopeSignal('待办有归宿/提醒有触发条件/承诺有回执'), false, '「触发条件」是内容特征')
+})
+
+test('I3 无信号 ∧ 有近邻 ⇒ 进 scope 风险清单（合取的两个条件都满足）', () => {
+  const rep = auditSkills([
+    rec('aaa-ops', '客户支持运营：SLA 口径 / 分诊矩阵 fail-closed / 升级阈值 + 可跑判据（实测五项 PASS）'),
+    rec('bbb-pay', '电商与支付：状态机 fail-closed / 幂等键 / 验签 + 可跑判据（实测五项 PASS）'),
+  ])
+  assert.ok(rep.pairs.length > 0, '装置自检：这两条必须先是词法近邻（否则测的是别的东西）')
+  assert.equal(rep.scopeRisks.length, 2, '两条都无信号且互为近邻 ⇒ 都该进清单')
+  assert.ok(rep.scopeRisks[0].maxNeighbor >= 0.15, '近邻值必须过门槛')
+  assert.notEqual(rep.scopeRisks[0].neighbor, rep.scopeRisks[0].dir, '近邻必须指向**对方**')
+})
+
+test('I4 对照组·有信号的两条（即使互为近邻）⇒ **不进** scope 风险清单', () => {
+  const rep = auditSkills([
+    rec('aaa-one', 'Test levels for plugins. Use when testing plugins.'),
+    rec('bbb-two', 'Test levels for plugins. Use when testing plugins or package changes.'),
+  ])
+  assert.ok(rep.pairs.length > 0, '装置自检：对照组必须先成立（不成立 = 实验无结论）')
+  assert.equal(rep.scopeRisks.length, 0, '已声明「何时用」⇒ 不算 scope 风险')
+})
+
+test('I5 对照组·无信号但域内孤立（无近邻）⇒ **不进**清单', () => {
+  const rep = auditSkills([
+    rec('alpha-thing', '数据库迁移与回滚的实操纪律'),
+    rec('zeta-other', '语音合成与音色选择'),
+  ])
+  assert.equal(rep.pairs.length, 0, '装置自检：这两条必须真的不相干')
+  assert.equal(rep.scopeRisks.length, 0, '无近邻 ⇒ 缺触发词不影响选择（否则 133 条全是待办 = 没有待办）')
+})
+
+test('I6 有意指针（逐字相同 + 「已熔炼进」标记）⇒ **不进** scope 风险清单', () => {
+  const d = '已熔炼进 dsh-upgrade-adaptation 的防呆指针；本目录保留为上游资源树'
+  const rep = auditSkills([rec('dsh-benchmark-case', d), rec('dsh-upgrade-audit', d)])
+  assert.equal(rep.pairs.length, 1, '装置自检：逐字相同必须进候选池')
+  assert.equal(rep.scopeRisks.length, 0, '有意为之的占位符不是 scope 缺陷（论文 Table 2 的教训）')
+})
+
+test('I7 renderAudit：有风险时报出清单，注明与冗余档**同一把尺子**，并给可执行动作', () => {
+  const rep = auditSkills([
+    rec('aaa-ops', '客户支持运营：SLA 口径 / 分诊矩阵 fail-closed / 升级阈值 + 可跑判据（实测五项 PASS）'),
+    rec('bbb-pay', '电商与支付：状态机 fail-closed / 幂等键 / 验签 + 可跑判据（实测五项 PASS）'),
+  ])
+  const out = renderAudit(rep)
+  assert.match(out, /高优先/, '有风险时必须报出清单')
+  assert.match(out, /同一把尺子/, '必须说明它与冗余档共用门槛（判据单一真源）')
+  assert.match(out, /提升到 description/, '必须给**可执行**的动作，不只报数')
+})
+
+test('I8 renderAudit：零风险时**不得**出现「高优先」段（空必须分型）', () => {
+  const rep = auditSkills([rec('alpha-thing', '数据库迁移'), rec('zeta-other', '语音合成')])
+  const out = renderAudit(rep)
+  assert.ok(!out.includes('高优先'), '无风险时不得报清单（恒亮的判据不是证据）')
+  assert.match(out, /不需要动/, '但要说清其余条目**为何**不用动 —— 空必须分型')
 })
