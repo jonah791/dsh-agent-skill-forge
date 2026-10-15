@@ -437,6 +437,33 @@ export function apply(ctx: Context, config: Config): void {
     return { session, byTurn }
   }
 
+  /**
+   * 把轮次标记为**废渣**（信号 / 候选 / 通知不再提示它们）。
+   *
+   * `skill_commit`（炼化后标记）与 `skill_waste`（只标记不炼化）共用——抽出来是因为
+   * 原先它埋在 `skill_commit` 的闭包里，导致「想标记但不想产出」时无路可走（t-71fe865b）。
+   * @param session - 目标会话（用于落盘索引）。
+   * @param byTurn - 该会话的轮次索引（就地修改）。
+   * @param turns - 要标记的 turn 列表。
+   * @returns 本次**新**标记的轮数（已标记的不重复计）。
+   */
+  function markWastedTurns(
+    session: { id: string; header?: { cwd?: string } },
+    byTurn: Map<number, TurnIndex>,
+    turns: readonly number[],
+  ): number {
+    let marked = 0
+    for (const t of turns) {
+      const idx = byTurn.get(t)
+      if (idx !== undefined && !idx.wasted) {
+        idx.wasted = true
+        marked += 1
+      }
+    }
+    if (marked > 0) persistIndex(session, new Date().toISOString())
+    return marked
+  }
+
   // ---------- 工具 1：skill_signals ----------
   const signalsTool: ToolDefinition = defineTool({
     name: 'skill_signals',
@@ -660,15 +687,7 @@ export function apply(ctx: Context, config: Config): void {
         if (sess === undefined || turns.length === 0) return
         const byTurn = indexBySession.get(sess.id)
         if (byTurn === undefined) return
-        let marked = 0
-        for (const t of turns) {
-          const idx = byTurn.get(t)
-          if (idx !== undefined && !idx.wasted) {
-            idx.wasted = true
-            marked += 1
-          }
-        }
-        if (marked > 0) persistIndex(sess, new Date().toISOString())
+        markWastedTurns(sess, byTurn, turns)
       }
       const cwd = exec.agent?.session.header?.cwd
 
@@ -945,11 +964,62 @@ export function apply(ctx: Context, config: Config): void {
     },
   })
 
+  /**
+   * 工具 7：skill_waste（只标记不炼化）。
+   *
+   * 为什么需要（t-71fe865b）：`skill_commit` 是唯一的废渣标记入口，但它**必须产出**一个产物
+   * （guidance / workflow / tool）⇒ 「轨迹价值已由别处消化」或「判定不值得炼化」时无路可走，
+   * 那些轮会**永远**留在信号面里重复提示。本工具把「标记」与「产出」解耦。
+   */
+  const wasteTool: ToolDefinition = defineTool({
+    name: 'skill_waste',
+    description: '只标记不炼化（可写）：把指定轮次标记为**废渣**——信号 / 候选 / 通知不再提示它们，但**不产出任何技能或台账**。'
+      + '用途：轨迹价值已由别的方式消化（已写进记忆 / 别的技能 / 已手动处理），或判定它不值得炼化。'
+      + '⚠ 它是**声明**不是**逃避**：标记后该轮的信号**不再出现**——若你只是「暂时不想炼化」，别用它（留着信号才会再提醒你）。'
+      + '判据：标记后 skill_signals 里该轮 wasted=true。',
+    parameters: {
+      turns: { type: 'array', items: { type: 'number' }, required: true, description: '要标记的 turn 列表' },
+      reason: { type: 'string', description: '为什么标记（回显便于回溯）' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          marked: { type: 'number', required: true, description: '本次**新**标记的轮数（已标记的不重复计）' },
+          notFound: { type: 'array', items: { type: 'number' }, required: true, description: '索引里不存在的 turn（未标记）' },
+          note: { type: 'string', required: true },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: '已标记废渣 ' + String(value.marked) + ' 轮'
+          + (value.notFound.length > 0 ? '（' + String(value.notFound.length) + ' 轮不在索引里，未标记）' : '')
+          + '｜' + value.note,
+      }],
+    },
+    async execute(args, exec) {
+      const { session, byTurn } = turnsOf(exec)
+      if (session === undefined) return { marked: 0, notFound: [], note: '无可用会话' }
+      const turns = (args.turns as number[] | undefined) ?? []
+      if (turns.length === 0) return { marked: 0, notFound: [], note: 'turns 为空——没有要标记的轮次' }
+      const notFound = turns.filter((t) => !byTurn.has(t))
+      const marked = markWastedTurns(session, byTurn, turns)
+      return {
+        marked,
+        notFound,
+        note: '不产出任何技能 / 台账（只标记）；信号面不再提示这些轮'
+          + (args.reason !== undefined ? '｜理由：' + String(args.reason) : ''),
+      }
+    },
+  })
+
   ctx.tools.register(signalsTool)
   ctx.tools.register(marksTool)
   ctx.tools.register(extractTool)
   ctx.tools.register(commitTool)
+  ctx.tools.register(wasteTool)
   ctx.tools.register(toolsTool)
   ctx.tools.register(auditTool)
-  ctx.logger('dsh-agent-skill-forge').info('ready（skill_signals / skill_marks / skill_extract / skill_commit / skill_tools / skill_audit 已注册——被动形态，决策归爱丽丝）')
+  ctx.logger('dsh-agent-skill-forge').info('ready（skill_signals / skill_marks / skill_extract / skill_commit / skill_waste / skill_tools / skill_audit 已注册——被动形态，决策归爱丽丝）')
 }

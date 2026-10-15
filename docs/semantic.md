@@ -8,7 +8,7 @@
 
 ## 1 · 定位与反定位
 
-**定位**：**被动**技能熔炉（Trace2Skill / Ctx2Skill 思想落地）——后台**零 LLM 成本**地采集会话轨迹索引（每轮的工具调用数 / 报错数 / 上下文字符数 / 步数），在阈值处**送达信号**（炼化通知、压缩提醒），并提供 `skill_signals` / `skill_marks` / `skill_extract` / `skill_commit` / `skill_tools` 五个工具，把「把经验炼成资产」变成可操作流程。
+**定位**：**被动**技能熔炉（Trace2Skill / Ctx2Skill 思想落地）——后台**零 LLM 成本**地采集会话轨迹索引（每轮的工具调用数 / 报错数 / 上下文字符数 / 步数），在阈值处**送达信号**（炼化通知、压缩提醒），并提供 `skill_signals` / `skill_marks` / `skill_extract` / `skill_commit` / `skill_waste` / `skill_tools` / `skill_audit` 七个工具，把「把经验炼成资产」变成可操作流程。
 
 **产物三态（2026-09-16 主人定调：扩充语义包括插件工具、具体的高效工作流）**：
 
@@ -59,7 +59,9 @@ session/event  ──┬─ user/message   → 记 contextChars（本轮输入�
                         └─ maybeCompactHint → 压缩提醒（受 compactHintEnabled 控制）
 工具面: skill_signals（轨迹轮次索引）/ skill_marks（压缩时标记的候选）/ skill_extract（提取轨迹+联动视图）
         / skill_commit（按 kind 落盘 guidance|workflow → SKILL.md；tool → 工具候选台账）
-        / skill_tools（工具候选台账：列 / 详情 / 状态流转）
+        / skill_waste（**只标记不炼化**：把轮次标为废渣，信号/候选不再提示；与 skill_commit 共用 markWastedTurns
+          ——解耦「标记」与「产出」，见 §9 2026-10-15 行）
+        / skill_tools（工具候选台账：列 / 详情 / 状态流转）/ skill_audit（技能库审计）
 ```
 
 不变量（invariants）：
@@ -150,7 +152,7 @@ session/event  ──┬─ user/message   → 记 contextChars（本轮输入�
 - 纯函数层：`src/policy.ts`（阈值/节流/状态迁移/**产物类型与结构判据**）、`src/text.ts`（文本摘要/工具引用/**具体性计数**/文案）、`src/aggregate.ts`（轮次聚合/视图构建）、`src/trace-store.ts`（落盘薄壳）
 - 同语义副本：无
 - **生态契约面（不属本条目的可运行语义）**：`src/fabric.ts` + `dsh-plugin.json`（2026-09-20 补 DSH Community Fabric 契约面）——Fabric 目前**只有文档**（无 SDK / 无正式 schema / 无 runtime），骨架自带声明「**现在不可运行**」；本插件的实际功能仍在 DSH/Cordis 面（`src/index.ts` + `cordis.patch.yml`）。⇒ 语义文档不为其背书、**不得**据此声称通过 Fabric conformance。
-- 未实现/未验证部分**显式标注**：① 压缩提醒的关闭只在本部署 profile 生效（插件默认仍是 `true`）② 轨迹索引的 `wasted` 标记只由 `skill_commit(turns=…)` 驱动，通知路径已按 `isCandidateTurn` 过滤但**通知投递本身**仍可能提及该轮所属批次 ③ `kind=tool` 只登记候选，**不生成**插件骨架（U4）
+- 未实现/未验证部分**显式标注**：① 压缩提醒的关闭只在本部署 profile 生效（插件默认仍是 `true`）② 轨迹索引的 `wasted` 标记由 `skill_commit(turns=…)` 或 `skill_waste` 驱动，通知路径已按 `isCandidateTurn` 过滤但**通知投递本身**仍可能提及该轮所属批次（U3）③ `kind=tool` 只登记候选，**不生成**插件骨架（U4）
 
 ## 9 · 实践修订记录
 
@@ -186,10 +188,12 @@ session/event  ──┬─ user/message   → 记 contextChars（本轮输入�
   - **线上验收（同日 19:17 · 首次真实调用）**：闸门如实报出「不可用（闸门超时 >15000ms）」而**没有**伪装成「无漂移」——四态设计（`off`/`clean`/`drift`/`unavailable`）在真实场景里兑现了它的全部目的。根因取证（同一脚本连跑三次）：**16714 / 1262 / 1248 ms** ⇒ PowerShell **冷启动 ≈ 16.7s**（web 重启后首次 spawn），热态 1.25s；旧默认 15s **差一点**。修法：默认超时 → **60s**，并新增 `warmUpMirrorDrift()`（在 `apply()` 里**异步** spawn 预热，把冷启动从提交路径移走；`stdio:'ignore'` + **必须注册 `error` 监听**——未监听的子进程 `error` 会抛出并杀死宿主，§5.24）。测试 113 → **115**。
   - **线上验收第二轮（同日 19:22）**：报 drift **2 项** —— 正是刚炼化的新技能 `preprint-submission-prep` 未同步进资产仓；跑 `sync-skills.ps1` 后归零（真源 **151** = 镜像 **151**）。⇒ 闸门在它**启用的同一天**抓到了两次真实欠账：一次**仪器故障**、一次**内容漂移**。
 
+| 2026-10-15 | **工具 7 `skill_waste`：解耦「标记」与「产出」**（t-71fe865b）。触发：`skill_commit` 是唯一的废渣标记入口，但它**必须产出**一个产物（guidance / workflow / tool）⇒「轨迹价值已由别处消化」或「判定不值得炼化」时**无路可走**，那些轮会永远留在信号面里重复提示。⇒ 抽出 `markWastedTurns`（原先埋在 `skill_commit` 闭包里，无法复用）+ 新增 `skill_waste`（只标记、不落盘）。**两处刻意的设计**：① 工具描述写明「**它是声明不是逃避**——标记后该轮信号不再出现，若你只是『暂时不想炼化』别用它」（防止把去噪入口用成逃避炼化的借口）；② `notFound` 单独报（索引里不存在的 turn 不静默吞掉）。**验收**：构建 + 现有 163 例全绿；线上真调——标记两个空轮（`ev 5 / tool 0`，正是「不值得炼化」的真实样本）⇒ `skill_signals` 显示 `[废]`；**幂等**（重复标记 ⇒ `marked 0`）。**顺带修正文档漂移**：§1 与 §3 原写「五个工具」，实际已 6 个（`skill_audit` 未列）。 |
+
 ## 10 · 未决问题
 
 - **U1** 压缩提醒关闭后，「压缩前炼化的收益最大化」这一动机由谁承接？（倾向：交给 §5.7 的日常炼化节奏，不再与压缩绑拍）
 - **U2** ~~是否给本插件补纯函数单测~~ → **已解决**（2026-09-14 可维护性补课抽出 policy/aggregate/text/trace-store，2026-09-16 扩至 **99 例**；2026-09-22 复核复跑 99/99 绿；**2026-09-28 扩至 115 例**——新增 `tests/mirror-drift.test.mjs` 14 例 + 预热 2 例，复跑 115/115 绿）
-- **U3** `wasted`（废渣）标记与通知路径的联动（当前 `skill_commit(turns)` 标记后，通知仍可能提示该轮所属批次）
+- **U3** `wasted`（废渣）标记与通知路径的联动（`skill_commit(turns)` 或 `skill_waste` 标记后，通知仍可能提示该轮所属批次）——**部分收窄**（2026-10-15：标记入口从 1 个变 2 个，「已消化 / 不值得炼化」的轮终于能被标记掉；但**通知路径本身的联动仍未做**）
 - **U4**（2026-09-16 新增）`kind=tool` 的候选能否直接驱动 `plugin_forge` 生成骨架（当前只登记，生成仍靠手工/显式调用 `plugin_forge`）——若要打通，须先定义「从候选到 spec」的映射（工具名/参数/实现要点从哪来）
 - **U5**（2026-09-16 新增）`workflow` 的具体性判据是否需要更强的形式（当前是计数门槛：≥2 步骤 + ≥1 片段）——计数可被「凑数」满足；是否需要断言「步骤与片段的一一对应」
