@@ -37,6 +37,35 @@ export function skillToolsPath(cwd: string): string {
 }
 
 /**
+ * 技能审计**裁决台账**路径（**不按 sessionId 隔离**，理由同工具候选台账）。
+ *
+ * 2026-10-15：审计器每轮报「术语重叠（需人读）」的对，我读完判定后又只活在当次会话里
+ * ⇒ 下一轮照样报，未来的我再读一遍（§5.39：规则层反复失效 ⇒ 换机制承载）。
+ * 台账跨会话累积——**裁决是关于技能库的结论，不是会话的旁路产物**。
+ */
+export function skillLedgerPath(cwd: string): string {
+  return join(cwd, '.dsh', 'skill-forge-ledger.json')
+}
+
+/** 裁决台账文件形状。`ledgers` 的键 = 技能目录（经 `ledgerDirKey` 归一）。 */
+export interface SkillLedgerFile {
+  updatedAt: string
+  ledgers: Record<string, Record<string, unknown>>
+}
+
+/**
+ * 技能目录 → 台账键。
+ *
+ * ⚠ **归一的意义**：同一目录可能以 `C:\\Users\\tr\\.agents\\skills` / `C:/Users/tr/.agents/skills`
+ *   两种写法抵达（工具参数是人/我手写的）⇒ 不归一会把同一个库分裂成两份台账，
+ *   而「裁决失效」正是那种**看不出来的**失效（各查各的，都显示正常）。
+ */
+export function ledgerDirKey(dir: string): string {
+  const norm = dir.replace(/\\/g, '/')
+  return /^[a-z]:/i.test(norm) ? norm.charAt(0).toLowerCase() + norm.slice(1) : norm
+}
+
+/**
  * 写 JSON（自动建父目录；2 空格缩进）。
  * @returns true = 已写入；false = 失败（不可写路径 / 序列化失败——吞错，不抛）
  */

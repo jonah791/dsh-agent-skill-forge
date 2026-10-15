@@ -31,6 +31,8 @@
  *   · **无时钟、无随机**：同一目录跑两次结果一致（可复算）。
  */
 
+import { createHash } from 'node:crypto'
+
 /** 一条技能的审计输入（由薄 I/O 层从盘上读出来喂进来）。 */
 export interface SkillRecord {
   /** 目录名（索引键） */
@@ -68,6 +70,117 @@ export interface PairFinding {
   severity: 'strong' | 'weak'
   /** 判据的原文证据（可复算：照这句自己去读一遍） */
   evidence: string
+}
+
+/* ── 裁决台账（人读结论的留痕）────────────────────────────────────────────────
+ *
+ * 存在理由（2026-10-15）：审计器每轮报 4 对「术语重叠（需人读）」，我读完判定 4/4 **互补**
+ *   （诊断 ≠ 验证 · 生命周期相邻 · 路由层明写不复制规则 · 工时口径 vs 收付款链路）。
+ *   ⚠ 但那个结论**只活在当次会话里** —— 下一轮它照样报「需人读」，未来的我再读一遍。
+ *   §5.39 形态：规则层反复失效时换机制承载 ⇒ 把裁决落到台账，**靠流程不靠记性**。
+ *
+ * ★ 核心性质：裁决**不是豁免权，是「这一版内容我读过」**。
+ *   每条裁决带**内容指纹**（description + 正文头部 —— 与审计判定**同域**）；
+ *   任一方内容变了 ⇒ 指纹不匹配 ⇒ 该对**自动回到「需人读」**（进 `staleVerdicts`）。
+ *   ⇒ 防的是「拿一份过期的判断继续豁免」—— 那比没裁决更坏（假绿）。
+ */
+
+/** 技能对的稳定键：**与顺序无关**（`a↔b` 与 `b↔a` 是同一条裁决）。
+ *  ⚠ 分隔符用 `|`：技能名是 kebab-case，不含它 ⇒ 无歧义，且人读友好。 */
+export function pairKey(a: string, b: string): string {
+  return a < b ? a + '|' + b : b + '|' + a
+}
+
+/** 一条裁决（台账的值；台账本体是 `Record<pairKey, PairVerdict>`）。 */
+export interface PairVerdict {
+  /** `complementary` = 职责互补（不该合并）· `redundant` = 真冗余（该合并）·
+   *  `intentional` = 有意指针（防呆占位符，正文没写标记词时由人补判） */
+  verdict: 'complementary' | 'redundant' | 'intentional'
+  /** 判定依据（**一句话说清「凭什么」**——未来的我要靠它复算，不能只写「已看过」） */
+  reason: string
+  /**
+   * ★ 各侧内容指纹，**按 `pairKey` 的字典序**（`[小, 大]`）。
+   *
+   * 为什么分侧存而不是拼成一个串：**「哪一侧变了」必须直接可算** ——
+   * 拼串再拆回来要复现写入时的排序逻辑，一旦排序口径漂移就静默算错。
+   * 分侧存 ⇒ `old[0] !== now.get(small)` 一眼定侧，无需解析。
+   */
+  fingerprints: [string, string]
+  /** 裁决时刻（ISO；人读线索，不参与判据） */
+  at: string
+}
+
+/** 单条技能的内容指纹 —— **与审计判定同域**（审计用 description 判档、用 bodyHead 判回捞）。 */
+export function contentFingerprint(rec: { description: string; bodyHead?: string }): string {
+  return createHash('sha256')
+    .update(rec.description + '\u0000' + (rec.bodyHead ?? ''))
+    .digest('hex')
+    .slice(0, 12)
+}
+
+/**
+ * 一对的指纹（按 `pairKey` 字典序排列）—— 与 `PairVerdict.fingerprints` **同一口径**。
+ * @returns `[小的一侧, 大的一侧]`；键不完整时返回空数组（调用方按「无效」处理）
+ */
+export function pairFingerprints(
+  a: string, b: string,
+  byDir: ReadonlyMap<string, { description: string; bodyHead?: string }>,
+): string[] {
+  const ra = byDir.get(a)
+  const rb = byDir.get(b)
+  if (ra === undefined || rb === undefined) return []
+  const [small, big] = a < b ? [ra, rb] : [rb, ra]
+  return [contentFingerprint(small), contentFingerprint(big)]
+}
+
+/** 把 `pairKey` 拆回两侧（`|` 不在技能名里 ⇒ 无歧义）。坏键 ⇒ `[undefined, undefined]`。 */
+export function splitPairKey(key: string): [string | undefined, string | undefined] {
+  const i = key.indexOf('|')
+  if (i <= 0 || i >= key.length - 1) return [undefined, undefined]
+  return [key.slice(0, i), key.slice(i + 1)]
+}
+
+/** 已裁决的对（指纹仍匹配 ⇒ 从「需人读」移出）。 */
+export interface ResolvedPair {
+  a: string
+  b: string
+  verdict: PairVerdict['verdict']
+  reason: string
+  at: string
+  /** 原档位（裁决前它落在哪一档——便于事后回看「我裁掉的是什么」） */
+  severity: 'strong' | 'weak'
+}
+
+/**
+ * 陈旧裁决 —— 台账里有、仍是候选，但**内容指纹对不上**（任一方描述/正文变了）。
+ *
+ * ⚠ **它是「必须可见」的一档**：此时该对**已自动回到「需人读」**（仍出现在 `pairs` 里），
+ *   而这里记下「为什么豁免失效」——否则读的人只会看到它突然又冒出来，看不出是自己改过内容。
+ *   ⇒ 防的是「拿一份过期的判断继续豁免」，那比没裁决更坏（假绿）。
+ */
+export interface StaleVerdict {
+  a: string
+  b: string
+  verdict: PairVerdict['verdict']
+  /** 当初的判定依据（人读线索） */
+  reason: string
+  at: string
+  /** 哪一侧内容变了（诊断：`a` / `b` / `both`）—— 没有这个就只知道「失效了」 */
+  changed: 'a' | 'b' | 'both'
+}
+
+/**
+ * 孤裁决 —— 台账里有、本次候选对里没有。
+ *
+ * ⚠ **两型必须分开**（「空必须分型」的一贯纪律）：
+ *   · `no-longer-similar`：两侧技能都在库，但已不再进候选 ⇒ 正常（将来又相似时裁决仍有效）
+ *   · `skill-missing`：至少一侧已不在库里 ⇒ 悬空引用（该清）
+ *   合成一个数就等于替读的人决定「这些要不要清」。
+ */
+export interface OrphanVerdict {
+  key: string
+  verdict: PairVerdict['verdict']
+  reason: 'no-longer-similar' | 'skill-missing'
 }
 
 /** scope 质量缺口（论文消融第一重要的维度）。 */
@@ -110,6 +223,12 @@ export interface AuditReport {
   /** scope 风险（无信号 ∧ 有近邻）—— **可行动清单**，按近邻相似度降序 */
   scopeRisks: ScopeRisk[]
   anomalies: Anomaly[]
+  /** ★ 已裁决且**指纹仍匹配**的对（从「需人读」移出——裁决不是豁免权，是「这一版内容我读过」） */
+  resolved: ResolvedPair[]
+  /** ★ 裁决已失效的对（内容变了 ⇒ 自动回到「需人读」；**必须可见**，不许静默恢复） */
+  staleVerdicts: StaleVerdict[]
+  /** ★ 孤裁决（台账里有、本次候选对里没有）—— 两型分开，见 `OrphanVerdict` */
+  orphanVerdicts: OrphanVerdict[]
   stats: {
     /** 候选对总数（剪枝 + 回捞）；论文 Table 2 用同一口径对比 SF-strict / SF-final / No gate */
     candidates: number
@@ -336,6 +455,9 @@ export function auditSkills(records: readonly SkillRecord[], opts: {
   oversized?: number
   /** 剪枝下限（缺省 `DESC_PRUNE_MIN` = 0.05，标定依据见该常量） */
   descPrune?: number
+  /** ★ 裁决台账（`pairKey` → 裁决）。缺省 `{}` = 无裁决（行为与加台账前**逐字一致**——
+   *  ⚠ 向后兼容硬约束：没台账时 `resolved`/`staleVerdicts`/`orphanVerdicts` 全空，报告不多一行。 */
+  ledger?: Readonly<Record<string, PairVerdict>>
 } = {}): AuditReport {
   const descPrune = opts.descPrune ?? DESC_PRUNE_MIN
   const nearDesc = opts.nearDupDesc ?? NEAR_DUP_DESC_THRESHOLD
@@ -443,12 +565,66 @@ export function auditSkills(records: readonly SkillRecord[], opts: {
   }
 
   const n = recs.length
+
+  // ── 裁决台账对账 ──────────────────────────────────────────────────────────
+  // 三档互不掩盖（「空必须分型」）：resolved（指纹匹配 ⇒ 从「需人读」移出）·
+  // stale（仍是候选但指纹不匹配 ⇒ **回落到需人读**，并记下是哪一侧变了）· orphan（本次候选里没有）。
+  const byDir = new Map<string, SkillRecord>()
+  for (const r of recs) byDir.set(r.dir, r)
+  const candidateKeys = new Set<string>()
+  for (const p of pairs) candidateKeys.add(pairKey(p.a, p.b))
+
+  const resolved: ResolvedPair[] = []
+  const staleVerdicts: StaleVerdict[] = []
+  const ledger = opts.ledger ?? {}
+  for (const [key, v] of Object.entries(ledger)) {
+    const [a, b] = splitPairKey(key)
+    if (a === undefined || b === undefined) continue // 坏键：不猜（下面的 orphan 也不认它）
+    const ra = byDir.get(a)
+    const rb = byDir.get(b)
+    if (ra === undefined || rb === undefined) continue // 缺一侧 ⇒ orphan 的 `skill-missing`
+    const pair = pairs.find((p) => (p.a === a && p.b === b) || (p.a === b && p.b === a))
+    if (pair === undefined) continue // 不是候选 ⇒ orphan 的 `no-longer-similar`
+    const now = pairFingerprints(a, b, byDir) // 按 pairKey 字典序 —— 与写入同一口径
+    const old = v.fingerprints
+    // 台账里形状不对的（旧版/手改）⇒ 一律算失效（**不静默接受**——假绿比多做一次人读更坏）
+    const okShape = Array.isArray(old) && old.length === 2
+    // 逐侧比对（分侧存的意义就在这：哪一侧变了一目了然）
+    const aChanged = !okShape || old[0] !== now[0]
+    const bChanged = !okShape || old[1] !== now[1]
+    if (!aChanged && !bChanged) {
+      resolved.push({ a: ra.dir, b: rb.dir, verdict: v.verdict, reason: v.reason, at: v.at, severity: pair.severity })
+    } else {
+      staleVerdicts.push({
+        a: ra.dir, b: rb.dir, verdict: v.verdict, reason: v.reason, at: v.at,
+        changed: aChanged && bChanged ? 'both' : (aChanged ? 'a' : 'b'),
+      })
+    }
+  }
+
+  const orphanVerdicts: OrphanVerdict[] = []
+  for (const [key, v] of Object.entries(ledger)) {
+    if (candidateKeys.has(key)) continue
+    const [a, b] = splitPairKey(key)
+    const missing = (a !== undefined && !byDir.has(a)) || (b !== undefined && !byDir.has(b))
+    orphanVerdicts.push({
+      key, verdict: v.verdict,
+      reason: missing ? 'skill-missing' : 'no-longer-similar',
+    })
+  }
+  orphanVerdicts.sort((x, y) => (x.key < y.key ? -1 : x.key > y.key ? 1 : 0))
+  staleVerdicts.sort((x, y) => (x.a < y.a ? -1 : x.a > y.a ? 1 : 0))
+  resolved.sort((x, y) => (x.a < y.a ? -1 : x.a > y.a ? 1 : 0))
+
   return {
     total: n,
     pairs: pairs.sort((x, y) => y.score - x.score),
     scopeGaps,
     scopeRisks,
     anomalies,
+    resolved,
+    staleVerdicts,
+    orphanVerdicts,
     stats: {
       candidates,
       // ⚠ `n < 2` 时 `(n*(n-1))/2` 会算出 `-0`（n=0 ⇒ 0×-1÷2）—— 严格相等下 `-0 !== 0`，
@@ -473,11 +649,14 @@ export function renderAudit(rep: AuditReport, opts: { maxRows?: number } = {}): 
   L.push('候选对 ' + rep.stats.candidates + ' ' + saved)
 
   const strong = rep.pairs.filter((p) => !p.intentional && p.severity === 'strong')
-  const weak = rep.pairs.filter((p) => !p.intentional && p.severity === 'weak')
+  const weakAll = rep.pairs.filter((p) => !p.intentional && p.severity === 'weak')
   const intentionalPairs = rep.pairs.filter((p) => p.intentional)
+  // ★ 已裁决且指纹仍匹配的对，**从「需人读」移出**（裁决 = 「这一版内容我读过」）
+  const resolvedKeys = new Set(rep.resolved.map((r) => pairKey(r.a, r.b)))
+  const weak = weakAll.filter((p) => !resolvedKeys.has(pairKey(p.a, p.b)))
   L.push('')
   L.push('≡ 冗余候选｜**强证据 ' + strong.length + ' 对**（正文也同源）· 术语重叠 ' + weak.length
-    + ' 对（需人读）· 有意指针 ' + intentionalPairs.length + ' 对（不算缺陷）')
+    + ' 对（需人读）· 已裁决 ' + rep.resolved.length + ' 对 · 有意指针 ' + intentionalPairs.length + ' 对（不算缺陷）')
   if (strong.length > 0) {
     L.push('  ★ 强证据（**多证据合取**：description 与正文都同源）：')
     for (const p of strong.slice(0, max)) {
@@ -493,8 +672,25 @@ export function renderAudit(rep: AuditReport, opts: { maxRows?: number } = {}): 
     }
     if (weak.length > max) L.push('      …（还有 ' + (weak.length - max) + ' 对）')
   }
+  // ── 已裁决（从上面那档移出；裁决依据必须可见——否则等于「删掉了就不管了」）──────────
+  if (rep.resolved.length > 0) {
+    L.push('  ✔ 已裁决 ' + rep.resolved.length + ' 对（**指纹仍匹配** ⇒ 从「需人读」移出）：')
+    for (const r of rep.resolved.slice(0, max)) {
+      L.push('      · [' + r.verdict + '] ' + r.a + ' ↔ ' + r.b + ' —— ' + r.reason)
+    }
+    if (rep.resolved.length > max) L.push('      …（还有 ' + (rep.resolved.length - max) + ' 对）')
+  }
+  // ── 陈旧裁决（内容变了 ⇒ 自动回到「需人读」）——**必须醒目** ──────────────────────
+  if (rep.staleVerdicts.length > 0) {
+    L.push('  ⚠ **裁决已失效 ' + rep.staleVerdicts.length + ' 对**（内容变过 ⇒ 已自动回到「需人读」，'
+      + '它们**仍在上面那档里**——裁决不是永久豁免）：')
+    for (const s of rep.staleVerdicts.slice(0, max)) {
+      L.push('      · ' + s.a + ' ↔ ' + s.b + '（' + s.changed + ' 侧内容变过；原判 ' + s.verdict + ' @' + s.at + '）')
+    }
+  }
   if (strong.length === 0 && weak.length === 0) {
-    L.push('  （无 —— 但先看下面「有意指针」那段：它们是被判据**主动排除**的，不是没检出）')
+    L.push('  （需人读档为空 —— 但先看「有意指针」与「已裁决」两段：'
+      + '它们是被判据**主动排除**或被裁决**处置过**的，不是没检出）')
   }
   if (intentionalPairs.length > 0) {
     L.push('  ⓘ 有意指针 ' + intentionalPairs.length + ' 对（防呆占位符 —— 论文 Table 2 的教训：'
@@ -526,6 +722,24 @@ export function renderAudit(rep: AuditReport, opts: { maxRows?: number } = {}): 
   L.push('结构异常｜' + rep.anomalies.length + ' 条')
   for (const a of rep.anomalies.slice(0, max)) L.push('  • [' + a.kind + '] ' + a.dir + '：' + a.detail)
   if (rep.anomalies.length > max) L.push('  …（还有 ' + (rep.anomalies.length - max) + ' 条）')
+
+  // ── 孤裁决（台账里有、本次候选没有）—— **两型分开报** ────────────────────────────
+  if (rep.orphanVerdicts.length > 0) {
+    const missing = rep.orphanVerdicts.filter((o) => o.reason === 'skill-missing')
+    const gone = rep.orphanVerdicts.filter((o) => o.reason === 'no-longer-similar')
+    L.push('')
+    L.push('裁决台账对账｜孤裁决 ' + rep.orphanVerdicts.length + ' 条'
+      + '（台账里有、本次候选对里没有）——两型不同处置，**不合报**：')
+    if (missing.length > 0) {
+      L.push('  ✖ skill-missing ' + missing.length + ' 条（至少一侧已不在库 ⇒ **悬空引用，该清**）：')
+      for (const o of missing.slice(0, max)) L.push('      · ' + o.key + '（' + o.verdict + '）')
+    }
+    if (gone.length > 0) {
+      L.push('  ⓘ no-longer-similar ' + gone.length + ' 条（两侧都在库、只是不再相似 ⇒ 正常，'
+        + '将来又相似时裁决仍有效）：')
+      for (const o of gone.slice(0, max)) L.push('      · ' + o.key + '（' + o.verdict + '）')
+    }
+  }
 
   L.push('')
   L.push('⚠ 边界：本审计**不判硬/软冲突** —— 那要读两条指令的行为语义，词法判据到不了那一层。'

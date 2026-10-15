@@ -33,7 +33,8 @@ import { join } from 'node:path'
 import { mkdirSync, writeFileSync, existsSync, readdirSync, readFileSync } from 'node:fs'
 import {
   auditSkills, parseFrontmatter, hasTriggerSection, renderAudit, DEFAULT_BODY_HEAD,
-  type SkillRecord,
+  pairFingerprints, pairKey,
+  type PairVerdict, type SkillRecord,
 } from './audit.js'
 import {
   advanceNotifyState,
@@ -65,7 +66,8 @@ import {
   extractToolRefs,
   summarizeBlocks,
 } from './text.js'
-import { readJsonFile, skillIndexPath, skillMarksPath, skillToolsPath, writeJsonFile } from './trace-store.js'
+import { readJsonFile, skillIndexPath, skillLedgerPath, ledgerDirKey, skillMarksPath, skillToolsPath, writeJsonFile } from './trace-store.js'
+import type { SkillLedgerFile } from './trace-store.js'
 import { buildDriftNote, probeMirrorDrift, warmUpMirrorDrift } from './mirror-drift.js'
 
 declare module '@deepseek-ai/dsh-llm' {
@@ -855,6 +857,18 @@ export function apply(ctx: Context, config: Config): void {
       dir: { type: 'string', description: '技能目录（缺省 `~/.agents/skills`；再退回 `<cwd>/.agents/skills`）' },
       maxRows: { type: 'number', description: '每段最多列几行（缺省 15）' },
       json: { type: 'boolean', description: '输出 JSON（供程序消费；缺省输出可读报告）' },
+      verdict: {
+        type: 'string',
+        enum: ['complementary', 'redundant', 'intentional'],
+        description: '**裁决一对「需人读」的候选**（须与 a / b / reason 同传）：'
+          + 'complementary=职责互补（不该合并）· redundant=真冗余（该合并）· intentional=有意指针。'
+          + '裁决写入跨会话台账（`.dsh/skill-forge-ledger.json`）并**带内容指纹**——'
+          + '任一方内容变了指纹即失效、该对自动回到「需人读」（裁决不是永久豁免）。'
+          + '⚠ 它只写台账，**永不改技能文件**。',
+      },
+      a: { type: 'string', description: '裁决：技能目录名之一（须与 verdict/reason 同传）' },
+      b: { type: 'string', description: '裁决：技能目录名之二（须与 verdict/reason 同传）' },
+      reason: { type: 'string', description: '裁决：**凭什么这样判**（必填——未来的我要靠它复算，不能只写「已看过」）' },
     },
     output: {
       schema: {
@@ -871,7 +885,61 @@ export function apply(ctx: Context, config: Config): void {
       }
       const recs = readSkillRecords(dir)
       if (recs.length === 0) return { text: '（目录为空或读不到任何 SKILL.md：' + dir + '）' }
-      const rep = auditSkills(recs)
+      const cwd = exec.agent?.session.header?.cwd
+
+      // ── 裁决台账（读；无 cwd 时退化为空台账——审计照常，只是「已裁决」档为空）────────
+      const dirKey = ledgerDirKey(dir)
+      const ledgerFile = typeof cwd === 'string' && cwd !== '' ? skillLedgerPath(cwd) : ''
+      const readLedger = (): Record<string, PairVerdict> => {
+        if (ledgerFile === '') return {}
+        const data = readJsonFile(ledgerFile) as SkillLedgerFile | undefined
+        const one = data?.ledgers?.[dirKey]
+        return (one ?? {}) as Record<string, PairVerdict>
+      }
+      let ledger = readLedger()
+
+      // ── 写裁决（显式传 verdict 时；**只写台账，永不改技能文件**）────────────────────
+      const wantVerdict = args.verdict as PairVerdict['verdict'] | undefined
+      if (wantVerdict !== undefined) {
+        const a = typeof args.a === 'string' ? args.a.trim() : ''
+        const b = typeof args.b === 'string' ? args.b.trim() : ''
+        const reason = typeof args.reason === 'string' ? args.reason.trim() : ''
+        // fail-loud：任何一项缺失都**拒绝**并说清缺什么（不静默降级成「只看看」）
+        if (a === '' || b === '' || reason === '') {
+          return { text: '✖ 裁决未写入：a / b / reason 三项都必填（收到 a=' + (a || '∅') + ' b=' + (b || '∅') + ' reason=' + (reason ? '有' : '∅') + '）' }
+        }
+        if (a === b) return { text: '✖ 裁决未写入：a 与 b 是同一个技能（' + a + '）' }
+        if (ledgerFile === '') return { text: '✖ 裁决未写入：无会话 cwd，写不了台账' }
+        const byDirAll = new Map(recs.map((r) => [r.dir, r]))
+        const ra = byDirAll.get(a)
+        const rb = byDirAll.get(b)
+        if (ra === undefined || rb === undefined) {
+          const miss = [ra === undefined ? a : '', rb === undefined ? b : ''].filter((s) => s !== '')
+          return { text: '✖ 裁决未写入：技能不在库里 —— ' + miss.join(' / ') }
+        }
+        const fps = pairFingerprints(a, b, byDirAll)
+        if (fps.length !== 2) return { text: '✖ 裁决未写入：算不出内容指纹（技能记录不完整）' }
+        const key = pairKey(a, b)
+        const prev = ledger[key]
+        ledger = { ...ledger, [key]: { verdict: wantVerdict, reason, fingerprints: [fps[0]!, fps[1]!], at: new Date().toISOString() } }
+        // 读-改-写整个文件（保留**别的技能目录**的台账——一个库的裁决不能覆盖另一个库）
+        const data = (readJsonFile(ledgerFile) as SkillLedgerFile | undefined) ?? { updatedAt: '', ledgers: {} }
+        const ledgers = { ...(data.ledgers ?? {}), [dirKey]: ledger }
+        const ok = writeJsonFile(ledgerFile, { updatedAt: new Date().toISOString(), ledgers })
+        if (!ok) return { text: '✖ 裁决未写入（台账写入失败：' + ledgerFile + '）——检查路径权限后重试' }
+        const action = prev === undefined ? '新登记' : (prev.verdict === wantVerdict ? '更新' : '改判（原 ' + prev.verdict + '）')
+        const base = '✔ 裁决已落盘（' + action + '）· ' + a + ' ↔ ' + b + ' ⇒ **' + wantVerdict + '**\n'
+          + '  依据：' + reason + '\n'
+          + '  指纹：' + fps[0] + ' / ' + fps[1] + '（任一方内容变 ⇒ 自动回到「需人读」）\n'
+          + '  台账：' + ledgerFile + '（键 = ' + dirKey + '）\n'
+          + '  ⚠ 只写了台账，**没有动任何技能文件**。'
+        // 写完后照常出报告（裁决当场生效——不必再跑一次）
+        const repAfter = auditSkills(recs, { ledger })
+        if (args.json === true) return { text: base + '\n\n' + JSON.stringify(repAfter, null, 1) }
+        return { text: base + '\n\n' + renderAudit(repAfter, { maxRows: typeof args.maxRows === 'number' ? args.maxRows : 15 }) }
+      }
+
+      const rep = auditSkills(recs, { ledger })
       if (args.json === true) return { text: JSON.stringify(rep, null, 1) }
       return { text: renderAudit(rep, { maxRows: typeof args.maxRows === 'number' ? args.maxRows : 15 }) }
     },

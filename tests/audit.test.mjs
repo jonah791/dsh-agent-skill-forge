@@ -15,13 +15,17 @@ import assert from 'node:assert/strict'
 import {
   auditSkills,
   bodySimilarity,
+  contentFingerprint,
   hasScopeSignal,
   hasTriggerSection,
   isIntentionalPointer,
   jaccard,
+  pairFingerprints,
+  pairKey,
   parseFrontmatter,
   renderAudit,
   shingleSet,
+  splitPairKey,
   tokenSet,
   NEAR_DUP_BODY_THRESHOLD,
 } from '../lib/audit.js'
@@ -353,4 +357,150 @@ test('I8 renderAudit：零风险时**不得**出现「高优先」段（空必�
   const out = renderAudit(rep)
   assert.ok(!out.includes('高优先'), '无风险时不得报清单（恒亮的判据不是证据）')
   assert.match(out, /不需要动/, '但要说清其余条目**为何**不用动 —— 空必须分型')
+})
+
+/* ── J 裁决台账：裁决是「这一版内容我读过」，**不是永久豁免** ──────────────────
+ * 存在理由（2026-10-15）：审计器每轮报 4 对「需人读」，我判完 4/4 互补，而那个结论
+ * 只活在当次会话里 ⇒ 下一轮照样报（§5.39：规则层反复失效 ⇒ 换机制承载）。
+ * ★ 本组最要紧的是 **J3/J4/J5/J6（内容变 ⇒ 裁决自动失效）**：它防的是「拿过期判断继续豁免」，
+ *   那比没裁决更坏（假绿）。
+ */
+
+/** 造一条「需人读」档的候选对（description 层重叠过门槛、正文不同 ⇒ severity=weak）。
+ *  ⚠ 形状照 I3 那对真实数据（`可跑判据（实测…PASS）` 这类共有尾句是词重叠的主要来源）——
+ *  最初我拍脑袋写的两条只重叠 ~0.04，**没进候选池**，是 J2 的「装置自检」把它抓出来的。 */
+const WEAK_PAIR = [
+  rec('aaa-debug', '调试插件运行时问题：宿主 API 语义 / 契约核对 + 可跑判据（实测三项 PASS）', { bodyHead: '甲甲甲甲甲 读宿主源码' }),
+  rec('bbb-test', '选择插件测试层级：单元 / 覆盖 / 真组合 + 可跑判据（实测三项 PASS）', { bodyHead: '乙乙乙乙乙 选最小充分集' }),
+]
+
+/** 造一条裁决（指纹照当前内容算 —— 与工具写入同一口径）。 */
+const verdictOf = (a, b, over = {}) => ({
+  verdict: 'complementary',
+  reason: '诊断 ≠ 验证：一个答「为什么坏了」，一个答「该跑哪几层证明好了」',
+  fingerprints: pairFingerprints(a, b, new Map(WEAK_PAIR.map((r) => [r.dir, r]))),
+  at: '2026-10-15T10:00:00.000Z',
+  ...over,
+})
+
+test('J1 金标准：无台账 ⇒ 三档全空，且**报告不多一行**（向后兼容硬约束）', () => {
+  const bare = auditSkills(WEAK_PAIR)
+  const withEmpty = auditSkills(WEAK_PAIR, { ledger: {} })
+  assert.equal(bare.resolved.length, 0, '无台账时不得凭空出现「已裁决」')
+  assert.equal(bare.staleVerdicts.length, 0)
+  assert.equal(bare.orphanVerdicts.length, 0)
+  assert.equal(renderAudit(bare), renderAudit(withEmpty), '空台账与不传台账必须逐字相同')
+})
+
+test('J2 尸体·指纹匹配 ⇒ 该对**从「需人读」移出**，且裁决依据可见', () => {
+  const key = pairKey('aaa-debug', 'bbb-test')
+  const rep = auditSkills(WEAK_PAIR, { ledger: { [key]: verdictOf('aaa-debug', 'bbb-test') } })
+  assert.equal(rep.pairs.length, 1, '装置自检：它必须先是「需人读」档的候选（否则测的是别的东西）')
+  assert.equal(rep.resolved.length, 1, '指纹匹配 ⇒ 进已裁决档')
+  assert.equal(rep.staleVerdicts.length, 0)
+  const out = renderAudit(rep)
+  assert.match(out, /已裁决 1 对/, '已裁决档必须报数')
+  assert.match(out, /诊断 ≠ 验证/, '裁决**依据**必须可见 —— 否则等于「删掉了就不管了」')
+  assert.match(out, /术语重叠 0 对/, '已裁决的对不得同时留在「需人读」档（两档互斥）')
+})
+
+test('J3 尸体·**内容变 ⇒ 裁决自动失效**（回到「需人读」，且注明是哪一侧变的）', () => {
+  const key = pairKey('aaa-debug', 'bbb-test')
+  const ledger = { [key]: verdictOf('aaa-debug', 'bbb-test') }
+  // 只改 b 侧正文 —— 指纹必然失配。⚠ 描述必须**保住共有尾句**，否则该对掉出候选池 ⇒
+  // 测的就变成「孤裁决」（J7 的场景）而不是「失效」——这条陷阱 J3/J5 各踩过一次。
+  const edited = [WEAK_PAIR[0], rec('bbb-test', '选择插件测试层级：单元 / 覆盖 / 真组合 + 可跑判据（实测三项 PASS）', { bodyHead: '乙乙乙乙乙 换了一段完全不同的正文' })]
+  const rep = auditSkills(edited, { ledger })
+  assert.equal(rep.pairs.filter((p) => !p.intentional).length, 1, '装置自检：改完仍须是候选对')
+  assert.equal(rep.orphanVerdicts.length, 0, '装置自检：不得掉成孤裁决（那说明编辑过头了）')
+  assert.equal(rep.resolved.length, 0, '内容变过 ⇒ **不得**继续算「已裁决」（裁决不是永久豁免）')
+  assert.equal(rep.staleVerdicts.length, 1, '失效必须被报出来')
+  assert.equal(rep.staleVerdicts[0].changed, 'b', '要能指出**哪一侧**变了（否则只知道「失效了」）')
+  assert.match(renderAudit(rep), /裁决已失效 1 对/, '失效必须醒目（否则读的人看不出是自己改过内容）')
+})
+
+test('J4 尸体·**描述变也失效**（指纹同域＝description + 正文头部，两者任一都算）', () => {
+  const key = pairKey('aaa-debug', 'bbb-test')
+  const ledger = { [key]: verdictOf('aaa-debug', 'bbb-test') }
+  // ⚠ 编辑必须**保住共有尾句**，否则该对掉出候选池 ⇒ 测的就变成「孤裁决」而非「失效」
+  const edited = [rec('aaa-debug', '调试插件运行时问题：宿主 API 语义 / 契约核对（已改过的描述）+ 可跑判据（实测三项 PASS）', { bodyHead: '甲甲甲甲甲 读宿主源码' }), WEAK_PAIR[1]]
+  const rep = auditSkills(edited, { ledger })
+  assert.equal(rep.pairs.filter((p) => !p.intentional).length, 1, '装置自检：改完仍须是候选对')
+  assert.equal(rep.orphanVerdicts.length, 0, '装置自检：不得掉成孤裁决（那说明编辑过头了）')
+  assert.equal(rep.staleVerdicts.length, 1, 'description 变 ⇒ 同样失效')
+  assert.equal(rep.staleVerdicts[0].changed, 'a')
+})
+
+test('J5 尸体·**两侧都变** ⇒ changed=both（不误报成单侧）', () => {
+  const key = pairKey('aaa-debug', 'bbb-test')
+  const ledger = { [key]: verdictOf('aaa-debug', 'bbb-test') }
+  const edited = [
+    rec('aaa-debug', '调试插件运行时问题：宿主 API 语义 / 契约核对 + 可跑判据（实测三项 PASS）', { bodyHead: '甲甲甲甲甲 改过' }),
+    rec('bbb-test', '选择插件测试层级：单元 / 覆盖 / 真组合 + 可跑判据（实测三项 PASS）', { bodyHead: '乙乙乙乙乙 也改过' }),
+  ]
+  const rep = auditSkills(edited, { ledger })
+  assert.equal(rep.orphanVerdicts.length, 0, '装置自检：描述保住 ⇒ 不得掉成孤裁决')
+  assert.equal(rep.staleVerdicts.length, 1, '装置自检：两侧都改 ⇒ 必须判失效')
+  assert.equal(rep.staleVerdicts[0].changed, 'both')
+})
+
+test('J6 尸体·**坏形状的台账值**（旧版/手改：指纹不是两元组）⇒ 一律算失效，不静默接受', () => {
+  const key = pairKey('aaa-debug', 'bbb-test')
+  // 模拟旧版字段名（单一拼接串）—— 形状不对必须算失效
+  const legacy = { [key]: { verdict: 'complementary', reason: '旧版', fingerprint: 'deadbeef-cafe', at: '2026-10-01T00:00:00.000Z' } }
+  const rep = auditSkills(WEAK_PAIR, { ledger: legacy })
+  assert.equal(rep.resolved.length, 0, '形状不对**不得**当匹配（假绿比多做一次人读更坏）')
+  assert.equal(rep.staleVerdicts.length, 1, '要报失效，让人看见它需要重判')
+})
+
+test('J7 尸体·孤裁决两型**分开报**（skill-missing ≠ no-longer-similar）', () => {
+  const ledger = {
+    [pairKey('aaa-debug', 'bbb-test')]: verdictOf('aaa-debug', 'bbb-test'),   // 本次候选内
+    [pairKey('aaa-debug', 'zzz-gone')]: verdictOf('aaa-debug', 'bbb-test'),   // zzz-gone 不在库
+    [pairKey('ccc-a', 'ddd-b')]: verdictOf('aaa-debug', 'bbb-test'),          // 两侧都在库但不相干
+  }
+  const recs = [...WEAK_PAIR, rec('ccc-a', '数据库迁移脚本的备份纪律'), rec('ddd-b', '语音合成的采样率取舍')]
+  const rep = auditSkills(recs, { ledger })
+  assert.equal(rep.orphanVerdicts.length, 2, '两条孤裁决')
+  const missing = rep.orphanVerdicts.filter((o) => o.reason === 'skill-missing')
+  const gone = rep.orphanVerdicts.filter((o) => o.reason === 'no-longer-similar')
+  assert.equal(missing.length, 1, '一侧不在库 ⇒ skill-missing（悬空引用，该清）')
+  assert.equal(gone.length, 1, '两侧在库只是不相似 ⇒ no-longer-similar（正常，将来仍有效）')
+  const out = renderAudit(rep)
+  assert.match(out, /skill-missing 1 条/)
+  assert.match(out, /no-longer-similar 1 条/)
+})
+
+test('J8 判据单调性：裁决**只减**「需人读」，绝不改变候选集本身', () => {
+  const key = pairKey('aaa-debug', 'bbb-test')
+  const bare = auditSkills(WEAK_PAIR)
+  const rep = auditSkills(WEAK_PAIR, { ledger: { [key]: verdictOf('aaa-debug', 'bbb-test') } })
+  assert.equal(rep.pairs.length, bare.pairs.length, 'pairs 是**检出层**，裁决不得动它（动了就是拿裁决伪造证据）')
+  assert.equal(rep.stats.candidates, bare.stats.candidates, '候选数同理')
+  assert.equal(rep.scopeRisks.length, bare.scopeRisks.length, 'scope 档不受裁决影响（两条独立判据）')
+})
+
+test('J9 pairKey / splitPairKey：与顺序无关，且坏键不猜', () => {
+  assert.equal(pairKey('b', 'a'), pairKey('a', 'b'), 'a↔b 与 b↔a 是同一条裁决')
+  assert.equal(pairKey('a', 'b'), 'a|b')
+  assert.deepEqual(splitPairKey('a|b'), ['a', 'b'])
+  assert.deepEqual(splitPairKey('|b'), [undefined, undefined], '缺左侧 ⇒ 不猜')
+  assert.deepEqual(splitPairKey('a|'), [undefined, undefined], '缺右侧 ⇒ 不猜')
+  assert.deepEqual(splitPairKey('nokey'), [undefined, undefined], '无分隔符 ⇒ 不猜')
+})
+
+test('J10 指纹分侧存 ⇒ 「哪一侧变了」直接可算（不靠解析拼接串）', () => {
+  const byDir = new Map(WEAK_PAIR.map((r) => [r.dir, r]))
+  const fps = pairFingerprints('aaa-debug', 'bbb-test', byDir)
+  assert.equal(fps.length, 2)
+  assert.equal(fps[0], contentFingerprint(byDir.get('aaa-debug')), '[0] 必须是字典序小的一侧')
+  assert.equal(fps[1], contentFingerprint(byDir.get('bbb-test')))
+  assert.deepEqual(pairFingerprints('bbb-test', 'aaa-debug', byDir), fps, '顺序无关（同一条裁决）')
+  assert.deepEqual(pairFingerprints('aaa-debug', 'zzz-missing', byDir), [], '缺一侧 ⇒ 空数组（不猜）')
+})
+
+test('J11 renderAudit：零裁决时**不得**出现「已裁决」段（空必须分型）', () => {
+  const out = renderAudit(auditSkills(WEAK_PAIR))
+  assert.ok(!out.includes('✔ 已裁决'), '没有裁决就别报「已裁决 0 对」占位（那是噪音）')
+  assert.ok(!out.includes('裁决已失效'), '同理，失效段也别占位')
 })
