@@ -14,7 +14,7 @@
   <a href="https://github.com/jonah791/dsh-agent-skill-forge"><img src="https://img.shields.io/badge/version-0.3.0-blue" alt="version"></a>
   <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
-  <img src="https://img.shields.io/badge/tests-118%20passed-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/tests-152%20passed-brightgreen" alt="tests">
 </p>
 
 **一句话**：把「这次会话里踩过的坑、验证过的流程、该固化的那个脚本」变成下次能直接用的资产——**指导**写成 `SKILL.md`、**具体工作流**写成带步骤与命令的 `SKILL.md`、**工具**登记进工具候选台账等 `plugin_forge` 成形。熔炉只做**采集与落盘**，蒸馏与写入由 agent 本人决定。
@@ -46,7 +46,7 @@
 | `skill_extract` | 提取轨迹（只读）：按 turn 范围从会话事件流提取事件序列文本（用户消息/模型动作/工具调用/结果与错误），供爱丽丝蒸馏分析。零 LLM 调用（纯数据提取）。`linkContext=true`（缺省）时输出联动视图，供蒸馏「上下文特征 → 应对策略」条件化技能。`startTurn` 必需；`endTurn` 缺省 = `startTurn`；`maxChars` 缺省 20000（超长分段返回） |
 | `skill_commit` | 把轨迹蒸馏产物落盘（**可写**）。产物类型由 `kind` 决定：`guidance` → SKILL.md；`workflow` → SKILL.md（frontmatter 带 kind）；`tool` → 工具候选台账。guidance/workflow 默认写 `~/.agents/skills/<name>/SKILL.md`，`scope=project` 写 `<cwd>/.agents/skills/`。纪律：技能只提供指导（决策/流程/规避），不提供工具——正文引用的工具限于系统工具面（提交时自动校验，幻觉工具会警告）。`turns` 声明的轮次提交后标记为**废渣**。落盘成功后若配了 `mirrorCheckScript`，会跑一次**只读**闸门并把镜像仓漂移读数追加进回执（只报数，不同步） |
 | `skill_tools` | 工具候选台账（读 + 流转）：`skill_commit(kind=tool)` 的产物。不传 `tool` 列全部候选（含状态计数）；只传 `tool` 看详情；传 `tool` + `status`/`plugin`/`note` 则流转该候选（`candidate` → `forged`/`abandoned`）。台账**跨会话累积**，不随会话结束蒸发 |
-| `skill_audit` | 技能库审计（**只读** · 2026-10-15 论文移植）：扫技能目录报三类 —— ≡ 冗余候选（**强证据** = description 与正文都同源；**术语重叠** = 只有描述层证据，**不是结论**）、scope 缺口（论文消融里影响最大的一维）、结构异常（无 frontmatter / 名不一致 / 超大）。候选生成照论文两段式：**结构剪枝 + 选择性回捞**（全量两两比对更差：假阳多、成本高）。⚠ **不判硬/软冲突** —— 那要读两条指令的行为语义，词法判据到不了那一层。论文依据：SkillFusion（arXiv:2610.15481v1） |
+| `skill_audit` | 技能库审计（**只读** · 2026-10-15 论文移植）：扫技能目录报三类 —— ≡ 冗余候选（**强证据** = description 与正文都同源；**术语重叠** = 只有描述层证据，**不是结论**）、scope 缺口（论文消融里影响最大的一维；**★ 高优先清单** = 「description 无「何时用」信号 ∧ 有词法近邻」的**合取** —— scope 的作用是**区分**，孤立域技能缺触发词不影响选择，所以「无触发段 N/186」那种全量读数没有行动性）、结构异常（无 frontmatter / 名不一致 / 超大）。候选生成照论文两段式：**结构剪枝 + 选择性回捞**（全量两两比对更差：假阳多、成本高）。⚠ **不判硬/软冲突** —— 那要读两条指令的行为语义，词法判据到不了那一层。论文依据：SkillFusion（arXiv:2610.15481v1） |
 
 背景行为（无工具面，自动发生）：
 
@@ -155,7 +155,7 @@ node -e "const fs=require('fs');const d='.dsh';const f=fs.readdirSync(d).filter(
 npm test        # = node --test "tests/*.test.mjs"（跑 lib/ 产物，需先 npm run build）
 ```
 
-**113 例离线测试全部通过**（`# pass 113 / # fail 0`，2026-09-28 复跑；旧记的 98 是更早快照）：
+**152 例离线测试全部通过**（`# pass 152 / # fail 0`，2026-10-15 复跑；旧记的 113 是 2026-09-28 快照）：
 
 | 文件 | 覆盖 |
 |------|------|
@@ -163,7 +163,8 @@ npm test        # = node --test "tests/*.test.mjs"（跑 lib/ 产物，需先 np
 | `tests/policy.test.mjs` | 决策纯函数：`decideCompactHint`（阈值 + 段内节流、边界值、跳过分支）、通知阈值推进（步数/工具双轨复合触发）、通知状态迁移（`migrateNotifyState`，含旧形状兼容）、`validateSkillCommit`（早退顺序：名字 → kind → kind 专属 → 正文；**向后兼容硬约束**；kind fail-closed；tool/workflow 形态与具体性门槛）、`resolveSkillKind`、工具引用提取与「幻觉工具」判定、`buildCommitNote` 文案 |
 | `tests/text.test.mjs` | 文本处理：frontmatter 拼装（description 换行折叠）、联动视图渲染、超长分段、空输入退化；**具体性计数** `countNumberedSteps` / `countConcreteSnippets`（含未闭合围栏不计）、`buildToolCandidateNote` 与 kind 文案 |
 | `tests/trace-store.test.mjs` | 落盘层：索引/标记按 `sessionId` 隔离的路径拼装、**工具台账不隔离**的路径语义、写 JSON 自动建父目录、读 JSON 对「不存在/坏 JSON/是目录」一律 `undefined`；**尸体测试**——父路径是普通文件的不可写路径 → 断言 `false` 且不抛 |
-| `tests/mirror-drift.test.mjs` | 镜像漂移闸门（14 例）：`parseDriftCheck` 以**退出码**为判据（0/1 是读数；2=路径缺失 / 3=真源冲突 ⇒ `null` = **仪器故障**，不得当「无漂移」）、项数解析不到降级为「项数未知」而非「0 项」；`buildDriftNote` 四态文案（`off`/`clean` 空串 · `drift` 带项数与指路 · `unavailable` 报故障）；`probeMirrorDrift` 未配置路径**不触发**子进程 |
+| `tests/mirror-drift.test.mjs` | 镜像漂移闸门（18 例）：`parseDriftCheck` 以**退出码**为判据（0/1 是读数；2=路径缺失 / 3=真源冲突 ⇒ `null` = **仪器故障**，不得当「无漂移」）、项数解析不到降级为「项数未知」而非「0 项」；`buildDriftNote` 四态文案（`off`/`clean` 空串 · `drift` 带项数与指路 · `unavailable` 报故障）；`probeMirrorDrift` 未配置路径**不触发**子进程 |
+| `tests/audit.test.mjs` | 技能库审计（**34 例**）：**金标准**（无关技能 ⇒ 零候选，判据不得恒亮）、**尸体**（逐字相同 / 词集重叠 / 无 description / 名不一致 / 超大 / 无 frontmatter 各一类）、**有意指针 vs 真冗余**（论文 Table 2 的教训：把本来有用的东西当冲突去改，就是 No gate 的 24 个假阳）、剪枝真的省、**回捞**（词集无交集但正文高度重叠 ⇒ 必须捞回，判据②）；`severity` 多证据合取（strong/weak 不得混成一个数）；**scope 风险**（无「何时用」信号 ∧ 有词法近邻的**合取**，含 4 个实测假阳尸体 + 2 个对照组）；渲染不得省略边界声明、空必须分型 |
 
 **无网络依赖、无真实外部服务依赖**：全部离线（纯函数 + 临时目录）。`memoryApi`（`dsh-agent-memory`）在测试中不需要——未挂载时技能索引回流被静默跳过，SKILL.md 仍是权威存储。
 
