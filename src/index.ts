@@ -46,6 +46,7 @@ import {
   validateSkillCommit,
 } from './policy.js'
 import type { SkillKind } from './policy.js'
+import { commitSkillPath, dirtyNotice, skillsRepoStatus } from './skills-repo.js'
 import {
   buildExtractView,
   buildSignalsView,
@@ -467,6 +468,7 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- 工具 1：skill_signals ----------
   const signalsTool: ToolDefinition = defineTool({
     name: 'skill_signals',
+    deferLoading: true,
     description: '技能熔炉信号（只读）：本会话轨迹轮次索引——每轮的事件数/工具调用数/报错数/估算 token。选候选轮次后用 skill_extract 提取轨迹分析。决策（蒸馏什么/何时蒸馏）归爱丽丝。',
     parameters: {
       limit: { type: 'number', description: '返回最近 N 轮（缺省 20）' },
@@ -516,10 +518,16 @@ export function apply(ctx: Context, config: Config): void {
       const { byTurn } = turnsOf(exec)
       const limit = (args.limit as number | undefined) ?? 20
       const view = buildSignalsView(byTurn.entries(), limit)
+      // 技能仓脏读数（lh-3482d40b ③，2026-11-12）：外部工具改写技能目录不走 skill_commit，
+      // 于是脏会累积到「某次有人想起来」为止（与 44 仓静默积压 143 提交同形）。
+      // 挂在这里是因为 skill_signals 是每次炼化提示都会经过的那个入口 —— 不靠记性。
+      const userSkillsRoot = join(process.env.DSH_AGENTS_HOME ?? join(homedir(), '.agents'), 'skills')
+      const dirty = dirtyNotice(skillsRepoStatus(userSkillsRoot))
       return {
         turns: view.turns,
         stats: view.stats,
-        note: '按 turn 索引（完整事件在会话日志，零冗余）；报错轮是规避规则素材，平稳轮是泛化行为素材——判断归爱丽丝',
+        note: '按 turn 索引（完整事件在会话日志，零冗余）；报错轮是规避规则素材，平稳轮是泛化行为素材——判断归爱丽丝'
+          + (dirty === '' ? '' : '\n' + dirty),
       }
     },
   })
@@ -530,6 +538,7 @@ export function apply(ctx: Context, config: Config): void {
   // 主人 2026-08-17：压缩触发时标记炼化候选（上下文最全时刻），压缩后按标记炼化——单次压缩收益最大化
   const marksTool: ToolDefinition = defineTool({
     name: 'skill_marks',
+    deferLoading: true,
     description: '压缩轨迹标记（只读）：最近一次压缩触发时标记的炼化候选 turn（含工具调用/报错/上下文规模特征）——压缩前上下文最全时刻的高价值轨迹，压缩后按此炼化收益最大化。只读信号，炼化决策归爱丽丝。',
     parameters: {},
     output: {
@@ -579,6 +588,7 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- 工具 2：skill_extract ----------
   const extractTool: ToolDefinition = defineTool({
     name: 'skill_extract',
+    deferLoading: true,
     description: '提取轨迹（只读）：按 turn 范围从会话事件流提取事件序列文本（用户消息/模型动作/工具调用/结果与错误），供爱丽丝蒸馏分析。零 LLM 调用（纯数据提取）。linkContext=true（缺省）时输出联动视图——显式标注「上下文特征」段（该范围用户输入内容摘要），与应对轨迹（工具/决策路径）交错呈现，供蒸馏「上下文特征 → 应对策略」条件化技能（Ctx2Skill 被动化，主人 08-17 定调）。',
     parameters: {
       startTurn: { type: 'number', required: true, description: '起始 turn' },
@@ -636,6 +646,7 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- 工具 3：skill_commit ----------
   const commitTool: ToolDefinition = defineTool({
     name: 'skill_commit',
+    deferLoading: true,
     description: '把轨迹蒸馏产物落盘（可写）。产物类型由 kind 决定（2026-09-16 语义扩充）：guidance=条件化行为规则 → SKILL.md；workflow=**具体**高效工作流（需 ≥2 条编号步骤 + ≥1 处可执行片段）→ SKILL.md（frontmatter 带 kind）；tool=该固化的插件工具 → 工具候选台账（不写 SKILL.md——工具的载体是插件，不是技能目录）。guidance/workflow 默认写用户级 ~/.agents/skills/<name>/SKILL.md（跨项目可加载），scope=project 写 <cwd>/.agents/skills/。纪律：技能只提供指导（决策/流程/规避），不提供工具——正文引用的工具限于系统工具面（提交时自动校验，幻觉工具会警告）。turns 声明的轮次提交后标记为废渣。',
     parameters: {
       name: { type: 'string', required: true, description: '技能名（小写 kebab-case，如 alpha-refine）' },
@@ -751,13 +762,22 @@ export function apply(ctx: Context, config: Config): void {
       // （纪律写在文档里挡不住第二次复发，见技能 skill-maintenance §7）。
       // 只报数不同步；探测失败返回 unavailable 而非静默（静默就是又一次假绿）。
       const driftNote = buildDriftNote(probeMirrorDrift(config.mirrorCheckScript), config.mirrorCheckScript)
-      return { path, name, note: note + driftNote }
+      // 回滚点（lh-3482d40b ①，2026-11-12）：`skill_commit` 是技能目录的唯一写入口，
+      // 所以「改完自动提交」只有挂在这里才不靠记性。只 add **这一个文件**：
+      // `git add -A` 会把外部工具写的未审阅改动一起卷进来，那比不提交更糟。
+      const commit = scope === 'user' ? commitSkillPath(root, path, name) : { ok: true, detail: '项目级技能不在个人技能仓' }
+      // 外部改动的可见性（同条 ③）：脏本身不是错，**脏了没人知道**才是。
+      const dirtyNote = scope === 'user' ? dirtyNotice(skillsRepoStatus(root)) : ''
+      const gitNote = '\n' + (commit.ok ? '回滚点：' : '回滚点失败：') + commit.detail
+        + (dirtyNote === '' ? '' : '\n' + dirtyNote)
+      return { path, name, note: note + driftNote + gitNote }
     },
   })
 
   // ---------- 工具 4：skill_tools（工具候选台账 · 2026-09-16 语义扩充）----------
   const toolsTool: ToolDefinition = defineTool({
     name: 'skill_tools',
+    deferLoading: true,
     description: '工具候选台账（读 + 流转）：skill_commit(kind=tool) 的产物——「这个反复手写的脚本该固化成哪个插件工具」。不传 tool 列出全部候选（含状态计数）；只传 tool 看详情；传 tool + status/plugin/note 则流转该候选（candidate → forged/abandoned）。台账**跨会话累积**（<cwd>/.dsh/skill-forge-tools.json），不随会话结束蒸发。',
     parameters: {
       tool: { type: 'string', description: '工具名（不传=列全部）' },
@@ -864,6 +884,7 @@ export function apply(ctx: Context, config: Config): void {
 
   const auditTool: ToolDefinition = defineTool({
     name: 'skill_audit',
+    deferLoading: true,
     description: '技能库审计（论文移植 · SkillFusion arXiv:2610.15481v1）：扫技能目录报三类 —— '
       + '≡ 冗余候选（**强证据** = description 与正文都同源；**术语重叠** = 只有描述层证据，**不是结论**）、'
       + 'scope 缺口（论文消融里影响最大的一维）——其中 **★ 高优先清单** = 「description 无「何时用」信号 '
@@ -973,6 +994,7 @@ export function apply(ctx: Context, config: Config): void {
    */
   const wasteTool: ToolDefinition = defineTool({
     name: 'skill_waste',
+    deferLoading: true,
     description: '只标记不炼化（可写）：把指定轮次标记为**废渣**——信号 / 候选 / 通知不再提示它们，但**不产出任何技能或台账**。'
       + '用途：轨迹价值已由别的方式消化（已写进记忆 / 别的技能 / 已手动处理），或判定它不值得炼化。'
       + '⚠ 它是**声明**不是**逃避**：标记后该轮的信号**不再出现**——若你只是「暂时不想炼化」，别用它（留着信号才会再提醒你）。'
